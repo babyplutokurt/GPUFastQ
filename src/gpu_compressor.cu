@@ -1,9 +1,8 @@
+#include "gpufastq/codec_gpu_nvcomp.cuh"
 #include "gpufastq/gpu_compressor.hpp"
 #include "gpufastq/fastq_parser.hpp"
 
 #include <cuda_runtime.h>
-#include <nvcomp.h>
-#include <nvcomp/zstd.hpp>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 
@@ -47,19 +46,6 @@ uint64_t sum_sizes(const std::vector<uint64_t> &sizes) {
 template <typename T> void cuda_free_if_set(T *ptr) {
   if (ptr != nullptr) {
     cudaFree(ptr);
-  }
-}
-
-void check_nvcomp_status(const nvcompStatus_t *status_ptr,
-                         const char *operation) {
-  if (status_ptr == nullptr) {
-    throw std::runtime_error(std::string("nvcomp returned a null status for ") +
-                             operation);
-  }
-  if (*status_ptr != nvcompSuccess) {
-    throw std::runtime_error(std::string("nvcomp failed during ") + operation +
-                             " with status " +
-                             std::to_string(static_cast<int>(*status_ptr)));
   }
 }
 
@@ -126,44 +112,6 @@ __global__ void gather_fields_kernel(const uint8_t *raw_bytes,
   }
 }
 
-std::vector<uint8_t> gpu_compress_device_buffer(const uint8_t *d_input,
-                                                size_t input_size,
-                                                size_t chunk_size,
-                                                cudaStream_t stream) {
-  if (input_size == 0) {
-    return {};
-  }
-
-  std::vector<uint8_t> output;
-  nvcomp::ZstdManager manager(
-      chunk_size, nvcompBatchedZstdCompressDefaultOpts,
-      nvcompBatchedZstdDecompressDefaultOpts, stream, nvcomp::NoComputeNoVerify,
-      nvcomp::BitstreamKind::NVCOMP_NATIVE);
-
-  auto comp_config = manager.configure_compression(input_size);
-
-  uint8_t *d_output = nullptr;
-  size_t *d_comp_size = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_output, comp_config.max_compressed_buffer_size));
-  CUDA_CHECK(cudaMalloc(&d_comp_size, sizeof(size_t)));
-
-  manager.compress(d_input, d_output, comp_config, d_comp_size);
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  check_nvcomp_status(comp_config.get_status(), "compression");
-
-  size_t comp_size = 0;
-  CUDA_CHECK(cudaMemcpy(&comp_size, d_comp_size, sizeof(size_t),
-                        cudaMemcpyDeviceToHost));
-
-  output.resize(comp_size);
-  CUDA_CHECK(
-      cudaMemcpy(output.data(), d_output, comp_size, cudaMemcpyDeviceToHost));
-
-  cudaFree(d_output);
-  cudaFree(d_comp_size);
-  return output;
-}
-
 ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
                                                     size_t input_size,
                                                     size_t field_slice_size,
@@ -180,10 +128,12 @@ ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
 
   for (size_t offset = 0; offset < input_size; offset += field_slice_size) {
     const size_t slice_size = std::min(field_slice_size, input_size - offset);
-    auto compressed = gpu_compress_device_buffer(d_input + offset, slice_size,
-                                                 nvcomp_chunk_size, stream);
-    result.chunk_sizes.push_back(compressed.size());
-    result.data.insert(result.data.end(), compressed.begin(), compressed.end());
+    auto compressed =
+        nvcomp_zstd_compress_device(d_input + offset, slice_size,
+                                    nvcomp_chunk_size, stream);
+    result.chunk_sizes.push_back(compressed.payload.size());
+    result.data.insert(result.data.end(), compressed.payload.begin(),
+                       compressed.payload.end());
   }
 
   return result;
@@ -214,7 +164,11 @@ gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
     std::vector<uint8_t> slice(
         compressed.begin() + static_cast<std::ptrdiff_t>(offset),
         compressed.begin() + static_cast<std::ptrdiff_t>(offset + chunk_size));
-    auto decompressed = gpu_decompress(slice);
+    const size_t expected_chunk_size =
+        static_cast<size_t>(std::min<uint64_t>(MAX_FIELD_SLICE_SIZE,
+                                               expected_size - output.size()));
+    ZstdCompressedBlock block{std::move(slice), expected_chunk_size};
+    auto decompressed = nvcomp_zstd_decompress(block);
     output.insert(output.end(), decompressed.begin(), decompressed.end());
     offset += chunk_size;
   }
@@ -335,7 +289,8 @@ std::vector<uint8_t> gpu_compress(const std::vector<uint8_t> &input,
                              cudaMemcpyHostToDevice, stream));
 
   std::vector<uint8_t> output =
-      gpu_compress_device_buffer(d_input, input.size(), chunk_size, stream);
+      nvcomp_zstd_compress_device(d_input, input.size(), chunk_size, stream)
+          .payload;
 
   cudaFree(d_input);
   cudaStreamDestroy(stream);
@@ -350,39 +305,9 @@ std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed) {
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
 
-  nvcomp::ZstdManager manager(
-      DEFAULT_CHUNK_SIZE, nvcompBatchedZstdCompressDefaultOpts,
-      nvcompBatchedZstdDecompressDefaultOpts, stream, nvcomp::NoComputeNoVerify,
-      nvcomp::BitstreamKind::NVCOMP_NATIVE);
-
-  uint8_t *d_comp = nullptr;
-  uint8_t *d_output = nullptr;
-  size_t *d_comp_size = nullptr;
-  const size_t compressed_size = compressed.size();
-
-  CUDA_CHECK(cudaMalloc(&d_comp, compressed_size));
-  CUDA_CHECK(cudaMalloc(&d_comp_size, sizeof(size_t)));
-  CUDA_CHECK(cudaMemcpyAsync(d_comp, compressed.data(), compressed_size,
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_comp_size, &compressed_size, sizeof(size_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  auto decomp_config = manager.configure_decompression(d_comp, d_comp_size);
-  check_nvcomp_status(decomp_config.get_status(), "decompression configure");
-  CUDA_CHECK(cudaMalloc(&d_output, decomp_config.decomp_data_size));
-
-  manager.decompress(d_output, d_comp, decomp_config, d_comp_size);
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  check_nvcomp_status(decomp_config.get_status(), "decompression");
-
-  std::vector<uint8_t> output(decomp_config.decomp_data_size);
-  CUDA_CHECK(cudaMemcpy(output.data(), d_output, decomp_config.decomp_data_size,
-                        cudaMemcpyDeviceToHost));
-
-  cudaFree(d_comp);
-  cudaFree(d_comp_size);
-  cudaFree(d_output);
+  std::vector<uint8_t> output =
+      nvcomp_zstd_decompress(ZstdCompressedBlock{compressed, compressed.size()},
+                             NVCOMP_ZSTD_CHUNK_SIZE_DEFAULT, stream);
   cudaStreamDestroy(stream);
   return output;
 }
@@ -393,10 +318,10 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
 
   CompressedFastqData result;
   result.num_records = data.num_records;
-  result.original_id_size = stats.identifiers_size;
-  result.original_seq_size = stats.basecalls_size;
-  result.original_qual_size = stats.quality_scores_size;
-  result.original_index_size = stats.line_index_size;
+  result.identifiers.original_size = stats.identifiers_size;
+  result.basecalls.original_size = stats.basecalls_size;
+  result.quality_scores.original_size = stats.quality_scores_size;
+  result.line_offsets.original_size = stats.line_index_size;
   result.line_offset_count = data.line_offsets.size();
 
   cudaStream_t stream;
@@ -492,9 +417,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
                                                  stats.identifiers_size,
                                                  field_slice_size, chunk_size,
                                                  stream);
-    result.compressed_identifiers = std::move(id_chunks.data);
+    result.identifiers.payload = std::move(id_chunks.data);
     result.compressed_identifier_chunk_sizes = std::move(id_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.compressed_identifiers.size() << " bytes"
+    std::cerr << "  -> " << result.identifiers.payload.size() << " bytes"
               << std::endl;
 
     std::cerr << "Compressing basecalls (" << stats.basecalls_size
@@ -503,9 +428,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
                                                   stats.basecalls_size,
                                                   field_slice_size, chunk_size,
                                                   stream);
-    result.compressed_basecalls = std::move(seq_chunks.data);
+    result.basecalls.payload = std::move(seq_chunks.data);
     result.compressed_basecall_chunk_sizes = std::move(seq_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.compressed_basecalls.size() << " bytes"
+    std::cerr << "  -> " << result.basecalls.payload.size() << " bytes"
               << std::endl;
 
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
@@ -514,10 +439,10 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
                                                    stats.quality_scores_size,
                                                    field_slice_size, chunk_size,
                                                    stream);
-    result.compressed_quality = std::move(qual_chunks.data);
+    result.quality_scores.payload = std::move(qual_chunks.data);
     result.compressed_quality_chunk_sizes =
         std::move(qual_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.compressed_quality.size() << " bytes"
+    std::cerr << "  -> " << result.quality_scores.payload.size() << " bytes"
               << std::endl;
 
     std::cerr << "Compressing line offsets (" << stats.line_index_size
@@ -525,10 +450,10 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
     auto index_chunks = gpu_compress_device_chunked(
         reinterpret_cast<const uint8_t *>(d_line_offsets), stats.line_index_size,
         field_slice_size, chunk_size, stream);
-    result.compressed_line_offsets = std::move(index_chunks.data);
+    result.line_offsets.payload = std::move(index_chunks.data);
     result.compressed_line_offset_chunk_sizes =
         std::move(index_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.compressed_line_offsets.size() << " bytes"
+    std::cerr << "  -> " << result.line_offsets.payload.size() << " bytes"
               << std::endl;
   } catch (...) {
     cuda_free_if_set(fields.identifiers);
@@ -564,30 +489,30 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
 FastqData decompress_fastq(const CompressedFastqData &compressed) {
   std::cerr << "Decompressing identifiers..." << std::endl;
   const auto identifiers =
-      gpu_decompress_chunked(compressed.compressed_identifiers,
+      gpu_decompress_chunked(compressed.identifiers.payload,
                              compressed.compressed_identifier_chunk_sizes,
-                             compressed.original_id_size);
+                             compressed.identifiers.original_size);
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;
   const auto basecalls =
-      gpu_decompress_chunked(compressed.compressed_basecalls,
+      gpu_decompress_chunked(compressed.basecalls.payload,
                              compressed.compressed_basecall_chunk_sizes,
-                             compressed.original_seq_size);
+                             compressed.basecalls.original_size);
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
   const auto quality_scores =
-      gpu_decompress_chunked(compressed.compressed_quality,
+      gpu_decompress_chunked(compressed.quality_scores.payload,
                              compressed.compressed_quality_chunk_sizes,
-                             compressed.original_qual_size);
+                             compressed.quality_scores.original_size);
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing line offsets..." << std::endl;
   const auto line_offset_bytes =
-      gpu_decompress_chunked(compressed.compressed_line_offsets,
+      gpu_decompress_chunked(compressed.line_offsets.payload,
                              compressed.compressed_line_offset_chunk_sizes,
-                             compressed.original_index_size);
+                             compressed.line_offsets.original_size);
   std::cerr << "  -> " << line_offset_bytes.size() << " bytes" << std::endl;
 
   const auto line_offsets =

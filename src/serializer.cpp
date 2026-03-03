@@ -52,11 +52,13 @@ std::vector<uint64_t> read_index(std::ifstream &f, size_t size) {
 }
 
 void validate_chunked_stream(const std::vector<uint8_t> &payload,
+                             size_t original_size,
                              const std::vector<uint64_t> &chunk_sizes,
                              const char *name) {
   const bool has_payload = !payload.empty();
   const bool has_chunks = !chunk_sizes.empty();
-  if (has_payload != has_chunks) {
+  const bool has_original = original_size != 0;
+  if (has_payload != has_chunks || has_payload != has_original) {
     throw std::runtime_error(std::string("Cannot serialize inconsistent ") +
                              name + " chunk metadata");
   }
@@ -70,14 +72,18 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
     throw std::runtime_error("Cannot open output file: " + filepath);
   }
 
-  validate_chunked_stream(data.compressed_identifiers,
+  validate_chunked_stream(data.identifiers.payload,
+                          data.identifiers.original_size,
                           data.compressed_identifier_chunk_sizes,
                           "identifier");
-  validate_chunked_stream(data.compressed_basecalls,
+  validate_chunked_stream(data.basecalls.payload,
+                          data.basecalls.original_size,
                           data.compressed_basecall_chunk_sizes, "basecall");
-  validate_chunked_stream(data.compressed_quality,
+  validate_chunked_stream(data.quality_scores.payload,
+                          data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
-  validate_chunked_stream(data.compressed_line_offsets,
+  validate_chunked_stream(data.line_offsets.payload,
+                          data.line_offsets.original_size,
                           data.compressed_line_offset_chunk_sizes,
                           "line-offset");
 
@@ -86,23 +92,23 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file, data.num_records);
   write_val(file, data.line_offset_count);
 
-  write_val(file, data.original_id_size);
-  write_val(file, static_cast<uint64_t>(data.compressed_identifiers.size()));
+  write_val(file, static_cast<uint64_t>(data.identifiers.original_size));
+  write_val(file, static_cast<uint64_t>(data.identifiers.payload.size()));
   write_val(file,
             static_cast<uint64_t>(data.compressed_identifier_chunk_sizes.size()));
 
-  write_val(file, data.original_seq_size);
-  write_val(file, static_cast<uint64_t>(data.compressed_basecalls.size()));
+  write_val(file, static_cast<uint64_t>(data.basecalls.original_size));
+  write_val(file, static_cast<uint64_t>(data.basecalls.payload.size()));
   write_val(file,
             static_cast<uint64_t>(data.compressed_basecall_chunk_sizes.size()));
 
-  write_val(file, data.original_qual_size);
-  write_val(file, static_cast<uint64_t>(data.compressed_quality.size()));
+  write_val(file, static_cast<uint64_t>(data.quality_scores.original_size));
+  write_val(file, static_cast<uint64_t>(data.quality_scores.payload.size()));
   write_val(file,
             static_cast<uint64_t>(data.compressed_quality_chunk_sizes.size()));
 
-  write_val(file, data.original_index_size);
-  write_val(file, static_cast<uint64_t>(data.compressed_line_offsets.size()));
+  write_val(file, static_cast<uint64_t>(data.line_offsets.original_size));
+  write_val(file, static_cast<uint64_t>(data.line_offsets.payload.size()));
   write_val(file,
             static_cast<uint64_t>(data.compressed_line_offset_chunk_sizes.size()));
 
@@ -111,10 +117,10 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_index(file, data.compressed_quality_chunk_sizes);
   write_index(file, data.compressed_line_offset_chunk_sizes);
 
-  write_blob(file, data.compressed_identifiers);
-  write_blob(file, data.compressed_basecalls);
-  write_blob(file, data.compressed_quality);
-  write_blob(file, data.compressed_line_offsets);
+  write_blob(file, data.identifiers.payload);
+  write_blob(file, data.basecalls.payload);
+  write_blob(file, data.quality_scores.payload);
+  write_blob(file, data.line_offsets.payload);
 }
 
 CompressedFastqData deserialize(const std::string &filepath) {
@@ -138,19 +144,19 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.num_records = read_val<uint64_t>(file);
   data.line_offset_count = read_val<uint64_t>(file);
 
-  data.original_id_size = read_val<uint64_t>(file);
+  data.identifiers.original_size = read_val<uint64_t>(file);
   const uint64_t comp_id_size = read_val<uint64_t>(file);
   const uint64_t comp_id_chunks = read_val<uint64_t>(file);
 
-  data.original_seq_size = read_val<uint64_t>(file);
+  data.basecalls.original_size = read_val<uint64_t>(file);
   const uint64_t comp_seq_size = read_val<uint64_t>(file);
   const uint64_t comp_seq_chunks = read_val<uint64_t>(file);
 
-  data.original_qual_size = read_val<uint64_t>(file);
+  data.quality_scores.original_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_chunks = read_val<uint64_t>(file);
 
-  data.original_index_size = read_val<uint64_t>(file);
+  data.line_offsets.original_size = read_val<uint64_t>(file);
   const uint64_t comp_index_size = read_val<uint64_t>(file);
   const uint64_t comp_index_chunks = read_val<uint64_t>(file);
 
@@ -159,10 +165,10 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.compressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
   data.compressed_line_offset_chunk_sizes = read_index(file, comp_index_chunks);
 
-  data.compressed_identifiers = read_blob(file, comp_id_size);
-  data.compressed_basecalls = read_blob(file, comp_seq_size);
-  data.compressed_quality = read_blob(file, comp_qual_size);
-  data.compressed_line_offsets = read_blob(file, comp_index_size);
+  data.identifiers.payload = read_blob(file, comp_id_size);
+  data.basecalls.payload = read_blob(file, comp_seq_size);
+  data.quality_scores.payload = read_blob(file, comp_qual_size);
+  data.line_offsets.payload = read_blob(file, comp_index_size);
 
   return data;
 }
