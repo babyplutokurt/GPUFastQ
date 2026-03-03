@@ -11,7 +11,7 @@ if(CUDA_TOOLKIT_PATH)
     set(CUDAToolkit_ROOT "${CUDA_TOOLKIT_PATH}")
 endif()
 
-project(GPUFastQ VERSION 0.1.0 LANGUAGES CXX CUDA)
+project(GPUFastQ VERSION 0.1.0 LANGUAGES C CXX CUDA)
 
 # GPU architecture
 set(CMAKE_CUDA_ARCHITECTURES 120)
@@ -22,6 +22,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(OpenMP REQUIRED)
 
 # ============================================================
 # nvcomp Configuration
@@ -92,23 +93,28 @@ add_library(gpufastq_lib
     src/serializer.cpp
 )
 
-find_package(OpenMP REQUIRED)
-find_library(BSC_LIBRARY NAMES bsc PATHS /usr/local/lib)
-if (NOT BSC_LIBRARY)
-    message(FATAL_ERROR "bsc library not found")
-endif()
+set(BSC_ENABLE_CUDA OFF CACHE BOOL "Disable libbsc CUDA support in submodule build" FORCE)
+set(BSC_BUILD_SHARED_LIB OFF CACHE BOOL "Build libbsc as a static library" FORCE)
+add_subdirectory(deps/libbsc deps/libbsc-build EXCLUDE_FROM_ALL)
+
+set(PROJECT_RUNTIME_RPATH
+    "${NVCOMP_LIB_DIR}"
+    "/usr/local/lib"
+    "$<TARGET_FILE_DIR:CUDA::cudart>"
+)
+
+list(REMOVE_DUPLICATES PROJECT_RUNTIME_RPATH)
 
 target_include_directories(gpufastq_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    /usr/local/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/libbsc
 )
 
 target_link_libraries(gpufastq_lib PUBLIC
     nvcomp
     CUDA::cudart
-    ${BSC_LIBRARY}
+    bsc::libbsc
     OpenMP::OpenMP_CXX
-    /home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu/libomp.so
 )
 
 set_target_properties(gpufastq_lib PROPERTIES
@@ -123,6 +129,6 @@ add_executable(gpufastq src/main.cpp)
 target_link_libraries(gpufastq PRIVATE gpufastq_lib)
 
 set_target_properties(gpufastq PROPERTIES
-    BUILD_RPATH "/home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu;/usr/local/lib"
-    INSTALL_RPATH "/home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu;/usr/local/lib"
+    BUILD_RPATH "${PROJECT_RUNTIME_RPATH}"
+    INSTALL_RPATH "${PROJECT_RUNTIME_RPATH}"
 )
