@@ -83,6 +83,16 @@ const char *identifier_column_kind_name(IdentifierColumnKind kind) {
   return "unknown";
 }
 
+const char *identifier_column_encoding_name(IdentifierColumnEncoding encoding) {
+  switch (encoding) {
+  case IdentifierColumnEncoding::Plain:
+    return "plain";
+  case IdentifierColumnEncoding::Delta:
+    return "delta";
+  }
+  return "unknown";
+}
+
 double compression_ratio_percent(uint64_t compressed_size, uint64_t raw_size) {
   if (raw_size == 0) {
     return 0.0;
@@ -173,6 +183,56 @@ int32_t parse_int32_token(const std::string &token) {
                              token);
   }
   return static_cast<int32_t>(value);
+}
+
+std::vector<uint8_t> int32_vector_to_bytes(const std::vector<int32_t> &values) {
+  std::vector<uint8_t> bytes(values.size() * sizeof(int32_t));
+  if (!values.empty()) {
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+  }
+  return bytes;
+}
+
+std::vector<int32_t> delta_encode_int32(const std::vector<int32_t> &values) {
+  std::vector<int32_t> deltas(values.size());
+  if (values.empty()) {
+    return deltas;
+  }
+
+  deltas[0] = values[0];
+  for (size_t i = 1; i < values.size(); ++i) {
+    const int64_t delta = static_cast<int64_t>(values[i]) -
+                          static_cast<int64_t>(values[i - 1]);
+    if (delta < std::numeric_limits<int32_t>::min() ||
+        delta > std::numeric_limits<int32_t>::max()) {
+      throw std::runtime_error("Identifier delta exceeds int32 range");
+    }
+    deltas[i] = static_cast<int32_t>(delta);
+  }
+  return deltas;
+}
+
+std::vector<int32_t> delta_decode_int32(const int32_t *values, size_t count) {
+  std::vector<int32_t> decoded(count);
+  if (count == 0) {
+    return decoded;
+  }
+
+  int64_t running = values[0];
+  if (running < std::numeric_limits<int32_t>::min() ||
+      running > std::numeric_limits<int32_t>::max()) {
+    throw std::runtime_error("Identifier delta decode overflow");
+  }
+  decoded[0] = static_cast<int32_t>(running);
+  for (size_t i = 1; i < count; ++i) {
+    running += values[i];
+    if (running < std::numeric_limits<int32_t>::min() ||
+        running > std::numeric_limits<int32_t>::max()) {
+      throw std::runtime_error("Identifier delta decode overflow");
+    }
+    decoded[i] = static_cast<int32_t>(running);
+  }
+  return decoded;
 }
 
 template <typename T> void cuda_free_if_set(T *ptr) {
@@ -297,6 +357,7 @@ CompressedIdentifierData compress_identifiers_columnar(
     auto &out = result.columns[i];
     out.kind = columns[i].kind;
     if (out.kind == IdentifierColumnKind::String) {
+      out.encoding = IdentifierColumnEncoding::Plain;
       out.values.original_size = columns[i].string_values.size();
       auto value_chunks = host_compress_chunked(columns[i].string_values,
                                                 field_slice_size,
@@ -316,17 +377,25 @@ CompressedIdentifierData compress_identifiers_columnar(
       out.lengths.payload = std::move(length_chunks.data);
       out.compressed_length_chunk_sizes = std::move(length_chunks.chunk_sizes);
     } else {
-      std::vector<uint8_t> value_bytes(columns[i].int_values.size() *
-                                       sizeof(int32_t));
-      if (!columns[i].int_values.empty()) {
-        std::memcpy(value_bytes.data(), columns[i].int_values.data(),
-                    value_bytes.size());
+      const auto plain_bytes = int32_vector_to_bytes(columns[i].int_values);
+      const auto delta_values = delta_encode_int32(columns[i].int_values);
+      const auto delta_bytes = int32_vector_to_bytes(delta_values);
+
+      auto plain_chunks =
+          host_compress_chunked(plain_bytes, field_slice_size, nvcomp_chunk_size);
+      auto delta_chunks =
+          host_compress_chunked(delta_bytes, field_slice_size, nvcomp_chunk_size);
+
+      out.values.original_size = plain_bytes.size();
+      if (sum_sizes(delta_chunks.chunk_sizes) < sum_sizes(plain_chunks.chunk_sizes)) {
+        out.encoding = IdentifierColumnEncoding::Delta;
+        out.values.payload = std::move(delta_chunks.data);
+        out.compressed_value_chunk_sizes = std::move(delta_chunks.chunk_sizes);
+      } else {
+        out.encoding = IdentifierColumnEncoding::Plain;
+        out.values.payload = std::move(plain_chunks.data);
+        out.compressed_value_chunk_sizes = std::move(plain_chunks.chunk_sizes);
       }
-      out.values.original_size = value_bytes.size();
-      auto value_chunks =
-          host_compress_chunked(value_bytes, field_slice_size, nvcomp_chunk_size);
-      out.values.payload = std::move(value_chunks.data);
-      out.compressed_value_chunk_sizes = std::move(value_chunks.chunk_sizes);
     }
   }
 
@@ -351,8 +420,10 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
 
   struct DecodedColumn {
     IdentifierColumnKind kind = IdentifierColumnKind::String;
+    IdentifierColumnEncoding encoding = IdentifierColumnEncoding::Plain;
     std::vector<uint8_t> value_bytes;
     std::vector<uint32_t> lengths;
+    std::vector<int32_t> decoded_int_values;
     const int32_t *int_values = nullptr;
     size_t value_offset = 0;
     size_t record_count = 0;
@@ -361,6 +432,7 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
   std::vector<DecodedColumn> columns(data.columns.size());
   for (size_t i = 0; i < data.columns.size(); ++i) {
     columns[i].kind = data.columns[i].kind;
+    columns[i].encoding = data.columns[i].encoding;
     columns[i].value_bytes = gpu_decompress_chunked(
         data.columns[i].values.payload, data.columns[i].compressed_value_chunk_sizes,
         data.columns[i].values.original_size);
@@ -383,8 +455,15 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
         throw std::runtime_error(
             "Decoded identifier numeric payload has an unexpected size");
       }
-      columns[i].int_values =
+      const auto *encoded_values =
           reinterpret_cast<const int32_t *>(columns[i].value_bytes.data());
+      if (columns[i].encoding == IdentifierColumnEncoding::Delta) {
+        columns[i].decoded_int_values =
+            delta_decode_int32(encoded_values, static_cast<size_t>(num_records));
+        columns[i].int_values = columns[i].decoded_int_values.data();
+      } else {
+        columns[i].int_values = encoded_values;
+      }
     }
   }
 
@@ -1148,6 +1227,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
           const uint64_t comp_total = comp_value_size + comp_length_size;
           std::cerr << "    [" << i << "] "
                     << identifier_column_kind_name(column.kind)
+                    << "/" << identifier_column_encoding_name(column.encoding)
                     << " values " << raw_value_size << " -> "
                     << comp_value_size << " B";
           if (column.kind == IdentifierColumnKind::String) {

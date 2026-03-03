@@ -90,6 +90,10 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
                           column.compressed_value_chunk_sizes,
                           "identifier-column-values");
   if (column.kind == IdentifierColumnKind::String) {
+    if (column.encoding != IdentifierColumnEncoding::Plain) {
+      throw std::runtime_error(
+          "Cannot serialize string identifier column with non-plain encoding");
+    }
     if (column.lengths.original_size != num_records * sizeof(uint32_t)) {
       throw std::runtime_error(
           "Cannot serialize string identifier column with invalid length size");
@@ -102,6 +106,11 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
 
   if (column.kind != IdentifierColumnKind::Int32) {
     throw std::runtime_error("Cannot serialize unknown identifier column kind");
+  }
+  if (column.encoding != IdentifierColumnEncoding::Plain &&
+      column.encoding != IdentifierColumnEncoding::Delta) {
+    throw std::runtime_error(
+        "Cannot serialize numeric identifier column with unknown encoding");
   }
   if (column.values.original_size != num_records * sizeof(int32_t)) {
     throw std::runtime_error(
@@ -281,6 +290,7 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_index(file, data.identifiers.compressed_flat_chunk_sizes);
   for (const auto &column : data.identifiers.columns) {
     write_val(file, static_cast<uint8_t>(column.kind));
+    write_val(file, static_cast<uint8_t>(column.encoding));
     write_val(file, static_cast<uint64_t>(column.values.original_size));
     write_val(file, static_cast<uint64_t>(column.values.payload.size()));
     write_val(file,
@@ -380,6 +390,8 @@ CompressedFastqData deserialize(const std::string &filepath) {
       static_cast<size_t>(identifier_column_count));
   for (auto &column : data.identifiers.columns) {
     column.kind = static_cast<IdentifierColumnKind>(read_val<uint8_t>(file));
+    column.encoding =
+        static_cast<IdentifierColumnEncoding>(read_val<uint8_t>(file));
     column.values.original_size = read_val<uint64_t>(file);
     const uint64_t value_payload_size = read_val<uint64_t>(file);
     const uint64_t value_chunk_count = read_val<uint64_t>(file);

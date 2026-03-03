@@ -12,6 +12,11 @@ enum class IdentifierColumnKind : uint8_t {
   Int32 = 1,
 };
 
+enum class IdentifierColumnEncoding : uint8_t {
+  Plain = 0,
+  Delta = 1,
+};
+
 enum class IdentifierCompressionMode : uint8_t {
   Flat = 0,
   Columnar = 1,
@@ -49,6 +54,7 @@ struct ZstdCompressedBlock {
 
 struct CompressedIdentifierColumn {
   IdentifierColumnKind kind = IdentifierColumnKind::String;
+  IdentifierColumnEncoding encoding = IdentifierColumnEncoding::Plain;
   ZstdCompressedBlock values;
   ZstdCompressedBlock lengths;
   std::vector<uint64_t> compressed_value_chunk_sizes;
