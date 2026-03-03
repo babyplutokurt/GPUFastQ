@@ -3,9 +3,16 @@
 #include <libbsc/libbsc.h>
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
+#include <thread>
+#include <utility>
 
 namespace gpufastq {
 
@@ -19,10 +26,50 @@ void bsc_check_init() {
   }
 }
 
+std::optional<size_t> parse_positive_size(const char *value) {
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+    throw std::runtime_error(
+        "GPUFASTQ_BSC_THREADS must be a positive integer");
+  }
+  if (parsed > std::numeric_limits<size_t>::max()) {
+    throw std::runtime_error("GPUFASTQ_BSC_THREADS exceeds supported range");
+  }
+  return static_cast<size_t>(parsed);
+}
+
+size_t resolve_worker_count(size_t requested_workers, size_t task_count) {
+  if (task_count == 0) {
+    return 1;
+  }
+
+  size_t configured_workers = requested_workers;
+  if (configured_workers == 0) {
+    configured_workers =
+        parse_positive_size(std::getenv("GPUFASTQ_BSC_THREADS")).value_or(0);
+  }
+
+  const unsigned int detected = std::thread::hardware_concurrency();
+  const size_t max_workers = detected == 0 ? 1 : static_cast<size_t>(detected);
+  const size_t default_workers =
+      std::max<size_t>(1, std::min(task_count, max_workers));
+
+  if (configured_workers == 0) {
+    return default_workers;
+  }
+  return std::max<size_t>(1, std::min(task_count, configured_workers));
+}
+
 } // namespace
 
 BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
-                                      size_t chunk_size) {
+                                      size_t chunk_size, size_t num_threads) {
   BscChunkedBuffer result;
   if (input_size == 0) {
     return result;
@@ -36,28 +83,79 @@ BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
 
   bsc_check_init();
 
-  for (size_t offset = 0; offset < input_size; offset += chunk_size) {
-    const size_t current_chunk_size = std::min(chunk_size, input_size - offset);
-    if (current_chunk_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("BSC chunk exceeds supported size");
+  const size_t chunk_count = (input_size + chunk_size - 1) / chunk_size;
+  std::vector<std::vector<uint8_t>> compressed_chunks(chunk_count);
+  result.compressed_chunk_sizes.resize(chunk_count);
+  result.uncompressed_chunk_sizes.resize(chunk_count);
+
+  std::atomic<size_t> next_chunk{0};
+  std::exception_ptr worker_error;
+  std::atomic<bool> failed{false};
+  std::mutex error_mutex;
+  const size_t worker_count = resolve_worker_count(num_threads, chunk_count);
+
+  const auto worker = [&]() {
+    try {
+      while (!failed.load(std::memory_order_relaxed)) {
+        const size_t chunk_index = next_chunk.fetch_add(1, std::memory_order_relaxed);
+        if (chunk_index >= chunk_count) {
+          return;
+        }
+
+        const size_t offset = chunk_index * chunk_size;
+        const size_t current_chunk_size =
+            std::min(chunk_size, input_size - offset);
+        if (current_chunk_size >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+          throw std::runtime_error("BSC chunk exceeds supported size");
+        }
+
+        const int input_chunk_size = static_cast<int>(current_chunk_size);
+        std::vector<uint8_t> compressed(current_chunk_size + LIBBSC_HEADER_SIZE);
+
+        const int compressed_size = bsc_compress(
+            input + offset, compressed.data(), input_chunk_size, 16, 128,
+            LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE,
+            LIBBSC_FEATURE_FASTMODE);
+        if (compressed_size < LIBBSC_NO_ERROR) {
+          throw std::runtime_error("BSC compression failed with code: " +
+                                   std::to_string(compressed_size));
+        }
+
+        compressed.resize(static_cast<size_t>(compressed_size));
+        result.compressed_chunk_sizes[chunk_index] =
+            static_cast<uint64_t>(compressed_size);
+        result.uncompressed_chunk_sizes[chunk_index] = current_chunk_size;
+        compressed_chunks[chunk_index] = std::move(compressed);
+      }
+    } catch (...) {
+      failed.store(true, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (worker_error == nullptr) {
+        worker_error = std::current_exception();
+      }
     }
+  };
 
-    const int input_chunk_size = static_cast<int>(current_chunk_size);
-    std::vector<uint8_t> compressed(current_chunk_size + LIBBSC_HEADER_SIZE);
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  for (size_t i = 0; i < worker_count; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+  if (worker_error != nullptr) {
+    std::rethrow_exception(worker_error);
+  }
 
-    const int compressed_size =
-        bsc_compress(input + offset, compressed.data(), input_chunk_size, 16,
-                     128, LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE,
-                     LIBBSC_FEATURE_FASTMODE);
-    if (compressed_size < LIBBSC_NO_ERROR) {
-      throw std::runtime_error("BSC compression failed with code: " +
-                               std::to_string(compressed_size));
-    }
-
-    result.compressed_chunk_sizes.push_back(compressed_size);
-    result.uncompressed_chunk_sizes.push_back(current_chunk_size);
-    result.data.insert(result.data.end(), compressed.begin(),
-                       compressed.begin() + compressed_size);
+  size_t total_compressed_size = 0;
+  for (uint64_t size : result.compressed_chunk_sizes) {
+    total_compressed_size += static_cast<size_t>(size);
+  }
+  result.data.reserve(total_compressed_size);
+  for (auto &compressed : compressed_chunks) {
+    result.data.insert(result.data.end(), compressed.begin(), compressed.end());
   }
 
   return result;
@@ -67,7 +165,7 @@ std::vector<uint8_t>
 bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
                        const std::vector<uint64_t> &compressed_chunk_sizes,
                        const std::vector<uint64_t> &uncompressed_chunk_sizes,
-                       uint64_t expected_size) {
+                       uint64_t expected_size, size_t num_threads) {
   if (compressed.empty()) {
     if (!compressed_chunk_sizes.empty() || !uncompressed_chunk_sizes.empty() ||
         expected_size != 0) {
@@ -84,13 +182,17 @@ bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
   bsc_check_init();
 
   std::vector<uint8_t> output(expected_size);
+  std::vector<size_t> compressed_offsets(compressed_chunk_sizes.size());
+  std::vector<size_t> uncompressed_offsets(uncompressed_chunk_sizes.size());
+
   size_t compressed_offset = 0;
   size_t uncompressed_offset = 0;
-
   for (size_t i = 0; i < compressed_chunk_sizes.size(); ++i) {
+    compressed_offsets[i] = compressed_offset;
+    uncompressed_offsets[i] = uncompressed_offset;
+
     const uint64_t compressed_chunk_size = compressed_chunk_sizes[i];
     const uint64_t uncompressed_chunk_size = uncompressed_chunk_sizes[i];
-
     if (compressed_chunk_size >
             static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
         uncompressed_chunk_size >
@@ -104,38 +206,79 @@ bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
       throw std::runtime_error("BSC uncompressed chunk metadata exceeds output");
     }
 
-    int block_size = 0;
-    int data_size = 0;
-    const int info_result = bsc_block_info(
-        compressed.data() + compressed_offset,
-        static_cast<int>(compressed_chunk_size), &block_size, &data_size,
-        LIBBSC_FEATURE_FASTMODE);
-    if (info_result != LIBBSC_NO_ERROR) {
-      throw std::runtime_error("BSC block info failed with code: " +
-                               std::to_string(info_result));
-    }
-    if (static_cast<uint64_t>(block_size) != compressed_chunk_size ||
-        static_cast<uint64_t>(data_size) != uncompressed_chunk_size) {
-      throw std::runtime_error("BSC chunk metadata does not match block header");
-    }
-
-    const int decomp_result = bsc_decompress(
-        compressed.data() + compressed_offset,
-        static_cast<int>(compressed_chunk_size),
-        output.data() + uncompressed_offset,
-        static_cast<int>(uncompressed_chunk_size), LIBBSC_FEATURE_FASTMODE);
-    if (decomp_result != LIBBSC_NO_ERROR) {
-      throw std::runtime_error("BSC decompression failed with code: " +
-                               std::to_string(decomp_result));
-    }
-
-    compressed_offset += compressed_chunk_size;
-    uncompressed_offset += uncompressed_chunk_size;
+    compressed_offset += static_cast<size_t>(compressed_chunk_size);
+    uncompressed_offset += static_cast<size_t>(uncompressed_chunk_size);
   }
-
   if (compressed_offset != compressed.size() ||
       uncompressed_offset != expected_size) {
     throw std::runtime_error("BSC chunked decompression produced an unexpected size");
+  }
+
+  std::atomic<size_t> next_chunk{0};
+  std::exception_ptr worker_error;
+  std::atomic<bool> failed{false};
+  std::mutex error_mutex;
+  const size_t worker_count =
+      resolve_worker_count(num_threads, compressed_chunk_sizes.size());
+
+  const auto worker = [&]() {
+    try {
+      while (!failed.load(std::memory_order_relaxed)) {
+        const size_t chunk_index = next_chunk.fetch_add(1, std::memory_order_relaxed);
+        if (chunk_index >= compressed_chunk_sizes.size()) {
+          return;
+        }
+
+        const uint64_t compressed_chunk_size = compressed_chunk_sizes[chunk_index];
+        const uint64_t uncompressed_chunk_size =
+            uncompressed_chunk_sizes[chunk_index];
+        const size_t comp_offset = compressed_offsets[chunk_index];
+        const size_t uncomp_offset = uncompressed_offsets[chunk_index];
+
+        int block_size = 0;
+        int data_size = 0;
+        const int info_result = bsc_block_info(
+            compressed.data() + comp_offset, static_cast<int>(compressed_chunk_size),
+            &block_size, &data_size, LIBBSC_FEATURE_FASTMODE);
+        if (info_result != LIBBSC_NO_ERROR) {
+          throw std::runtime_error("BSC block info failed with code: " +
+                                   std::to_string(info_result));
+        }
+        if (static_cast<uint64_t>(block_size) != compressed_chunk_size ||
+            static_cast<uint64_t>(data_size) != uncompressed_chunk_size) {
+          throw std::runtime_error(
+              "BSC chunk metadata does not match block header");
+        }
+
+        const int decomp_result = bsc_decompress(
+            compressed.data() + comp_offset, static_cast<int>(compressed_chunk_size),
+            output.data() + uncomp_offset,
+            static_cast<int>(uncompressed_chunk_size),
+            LIBBSC_FEATURE_FASTMODE);
+        if (decomp_result != LIBBSC_NO_ERROR) {
+          throw std::runtime_error("BSC decompression failed with code: " +
+                                   std::to_string(decomp_result));
+        }
+      }
+    } catch (...) {
+      failed.store(true, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (worker_error == nullptr) {
+        worker_error = std::current_exception();
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  for (size_t i = 0; i < worker_count; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+  if (worker_error != nullptr) {
+    std::rethrow_exception(worker_error);
   }
 
   return output;

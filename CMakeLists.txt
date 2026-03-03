@@ -22,8 +22,6 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenMP REQUIRED)
-
 # ============================================================
 # nvcomp Configuration
 # Usage: -DNVCOMP_ROOT=/path/to/nvcomp
@@ -95,6 +93,7 @@ add_library(gpufastq_lib
 )
 
 set(BSC_ENABLE_CUDA OFF CACHE BOOL "Disable libbsc CUDA support in submodule build" FORCE)
+set(BSC_ENABLE_OPENMP OFF CACHE BOOL "Disable libbsc OpenMP support in submodule build" FORCE)
 set(BSC_BUILD_SHARED_LIB OFF CACHE BOOL "Build libbsc as a static library" FORCE)
 add_subdirectory(deps/libbsc deps/libbsc-build EXCLUDE_FROM_ALL)
 
@@ -115,7 +114,6 @@ target_link_libraries(gpufastq_lib PUBLIC
     nvcomp
     CUDA::cudart
     bsc::libbsc
-    OpenMP::OpenMP_CXX
 )
 
 set_target_properties(gpufastq_lib PROPERTIES

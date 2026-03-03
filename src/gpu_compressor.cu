@@ -292,7 +292,8 @@ std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed) {
   return output;
 }
 
-CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
+CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
+                                   size_t bsc_threads) {
   const FastqFieldStats stats = compute_field_stats(data);
   const size_t field_slice_size = MAX_FIELD_SLICE_SIZE;
 
@@ -432,7 +433,8 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
     }
     auto qual_chunks = bsc_compress_chunked(h_quality_scores.data(),
                                             stats.quality_scores_size,
-                                            BSC_QUALITY_CHUNK_SIZE);
+                                            BSC_QUALITY_CHUNK_SIZE,
+                                            bsc_threads);
     result.quality_scores.payload = std::move(qual_chunks.data);
     result.compressed_quality_chunk_sizes =
         std::move(qual_chunks.compressed_chunk_sizes);
@@ -484,7 +486,8 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
   return result;
 }
 
-FastqData decompress_fastq(const CompressedFastqData &compressed) {
+FastqData decompress_fastq(const CompressedFastqData &compressed,
+                           size_t bsc_threads) {
   std::cerr << "Decompressing identifiers..." << std::endl;
   const auto identifiers =
       gpu_decompress_chunked(compressed.identifiers.payload,
@@ -503,7 +506,7 @@ FastqData decompress_fastq(const CompressedFastqData &compressed) {
       compressed.quality_scores.payload,
       compressed.compressed_quality_chunk_sizes,
       compressed.uncompressed_quality_chunk_sizes,
-      compressed.quality_scores.original_size);
+      compressed.quality_scores.original_size, bsc_threads);
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing line lengths..." << std::endl;

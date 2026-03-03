@@ -18,9 +18,11 @@ std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed);
 
 /// Extract identifiers/basecalls/quality plus delta-coded line lengths and compress them.
 CompressedFastqData compress_fastq(const FastqData &data,
-                                   size_t chunk_size = DEFAULT_CHUNK_SIZE);
+                                   size_t chunk_size = DEFAULT_CHUNK_SIZE,
+                                   size_t bsc_threads = 0);
 
 /// Decompress field streams and rebuild the raw FASTQ byte buffer.
-FastqData decompress_fastq(const CompressedFastqData &compressed);
+FastqData decompress_fastq(const CompressedFastqData &compressed,
+                           size_t bsc_threads = 0);
 
 } // namespace gpufastq

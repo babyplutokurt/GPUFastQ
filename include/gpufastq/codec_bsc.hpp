@@ -15,12 +15,13 @@ struct BscChunkedBuffer {
 };
 
 BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
-                                      size_t chunk_size = BSC_QUALITY_CHUNK_SIZE);
+                                      size_t chunk_size = BSC_QUALITY_CHUNK_SIZE,
+                                      size_t num_threads = 0);
 
 std::vector<uint8_t>
 bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
                        const std::vector<uint64_t> &compressed_chunk_sizes,
                        const std::vector<uint64_t> &uncompressed_chunk_sizes,
-                       uint64_t expected_size);
+                       uint64_t expected_size, size_t num_threads = 0);
 
 } // namespace gpufastq
