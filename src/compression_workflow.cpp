@@ -57,7 +57,8 @@ int compress(const std::string &input_path, const std::string &output_path,
 
   const size_t compressed_payload_size =
       compressed.identifiers.payload.size() +
-      compressed.basecalls.payload.size() +
+      compressed.basecalls.packed_bases.payload.size() +
+      compressed.basecalls.n_positions.payload.size() +
       compressed.quality_scores.payload.size() +
       compressed.line_lengths.payload.size();
 

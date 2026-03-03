@@ -8,8 +8,10 @@
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -29,6 +31,7 @@ namespace gpufastq {
 namespace {
 
 constexpr size_t MAX_FIELD_SLICE_SIZE = 16 * 1024 * 1024;
+constexpr uint32_t BASECALL_N_BLOCK_SIZE = 8192;
 
 struct ChunkedCompressedBuffer {
   std::vector<uint8_t> data;
@@ -39,6 +42,13 @@ struct DeviceFieldBuffers {
   uint8_t *identifiers = nullptr;
   uint8_t *basecalls = nullptr;
   uint8_t *quality_scores = nullptr;
+};
+
+struct EncodedBasecallBuffers {
+  uint8_t *packed_bases = nullptr;
+  uint32_t *n_counts = nullptr;
+  uint64_t *n_offsets = nullptr;
+  uint16_t *n_positions = nullptr;
 };
 
 uint64_t sum_sizes(const std::vector<uint64_t> &sizes) {
@@ -107,6 +117,156 @@ __global__ void gather_fields_kernel(
   }
 }
 
+__device__ inline uint8_t encode_basecall_2bit(uint8_t base,
+                                               bool *is_n,
+                                               bool *is_valid) {
+  switch (base) {
+  case 'A':
+  case 'a':
+    *is_n = false;
+    *is_valid = true;
+    return 0;
+  case 'C':
+  case 'c':
+    *is_n = false;
+    *is_valid = true;
+    return 1;
+  case 'G':
+  case 'g':
+    *is_n = false;
+    *is_valid = true;
+    return 2;
+  case 'T':
+  case 't':
+    *is_n = false;
+    *is_valid = true;
+    return 3;
+  case 'N':
+  case 'n':
+    *is_n = true;
+    *is_valid = true;
+    return 0;
+  default:
+    *is_n = false;
+    *is_valid = false;
+    return 0;
+  }
+}
+
+__global__ void count_n_basecalls_kernel(const uint8_t *basecalls,
+                                         uint64_t basecall_count,
+                                         uint32_t *n_counts,
+                                         uint64_t *invalid_position) {
+  const uint64_t block_index = blockIdx.x;
+  const uint64_t block_start =
+      block_index * static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE);
+  if (block_start >= basecall_count) {
+    return;
+  }
+
+  __shared__ uint32_t shared_count;
+  if (threadIdx.x == 0) {
+    shared_count = 0;
+  }
+  __syncthreads();
+
+  const uint64_t block_end = min(
+      block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE), basecall_count);
+  uint32_t local_count = 0;
+  for (uint64_t index = block_start + threadIdx.x; index < block_end;
+       index += blockDim.x) {
+    bool is_n = false;
+    bool is_valid = false;
+    encode_basecall_2bit(basecalls[index], &is_n, &is_valid);
+    if (!is_valid) {
+      atomicMin(reinterpret_cast<unsigned long long *>(invalid_position),
+                static_cast<unsigned long long>(index));
+      continue;
+    }
+    if (is_n) {
+      ++local_count;
+    }
+  }
+
+  if (local_count != 0) {
+    atomicAdd(&shared_count, local_count);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    n_counts[block_index] = shared_count;
+  }
+}
+
+__global__ void pack_basecalls_2bit_kernel(const uint8_t *basecalls,
+                                           uint64_t basecall_count,
+                                           uint8_t *packed_bases,
+                                           uint64_t *invalid_position) {
+  const uint64_t packed_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint64_t base_index = packed_index * 4;
+  if (base_index >= basecall_count) {
+    return;
+  }
+
+  uint8_t packed_value = 0;
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    const uint64_t index = base_index + lane;
+    if (index >= basecall_count) {
+      break;
+    }
+
+    bool is_n = false;
+    bool is_valid = false;
+    const uint8_t code =
+        encode_basecall_2bit(basecalls[index], &is_n, &is_valid);
+    if (!is_valid) {
+      atomicMin(reinterpret_cast<unsigned long long *>(invalid_position),
+                static_cast<unsigned long long>(index));
+      return;
+    }
+    packed_value |= static_cast<uint8_t>(code << (2 * lane));
+  }
+  packed_bases[packed_index] = packed_value;
+}
+
+__global__ void scatter_n_positions_kernel(const uint8_t *basecalls,
+                                           uint64_t basecall_count,
+                                           const uint64_t *n_offsets,
+                                           uint16_t *n_positions,
+                                           uint64_t *invalid_position) {
+  const uint64_t block_index = blockIdx.x;
+  const uint64_t block_start =
+      block_index * static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE);
+  if (block_start >= basecall_count) {
+    return;
+  }
+
+  __shared__ uint32_t cursor;
+  if (threadIdx.x == 0) {
+    cursor = 0;
+  }
+  __syncthreads();
+
+  const uint64_t block_end = min(
+      block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE), basecall_count);
+  for (uint64_t index = block_start + threadIdx.x; index < block_end;
+       index += blockDim.x) {
+    bool is_n = false;
+    bool is_valid = false;
+    encode_basecall_2bit(basecalls[index], &is_n, &is_valid);
+    if (!is_valid) {
+      atomicMin(reinterpret_cast<unsigned long long *>(invalid_position),
+                static_cast<unsigned long long>(index));
+      continue;
+    }
+    if (is_n) {
+      const uint32_t slot = atomicAdd(&cursor, 1u);
+      n_positions[n_offsets[block_index] + slot] =
+          static_cast<uint16_t>(index - block_start);
+    }
+  }
+}
+
 ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
                                                     size_t input_size,
                                                     size_t field_slice_size,
@@ -172,6 +332,190 @@ gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
   }
 
   return output;
+}
+
+CompressedBasecallData compress_basecalls_device(const uint8_t *d_basecalls,
+                                                 uint64_t basecall_count,
+                                                 size_t field_slice_size,
+                                                 size_t nvcomp_chunk_size,
+                                                 cudaStream_t stream) {
+  CompressedBasecallData result;
+  result.original_size = basecall_count;
+  result.n_block_size = BASECALL_N_BLOCK_SIZE;
+  if (basecall_count == 0) {
+    return result;
+  }
+
+  const uint64_t packed_size = (basecall_count + 3) / 4;
+  const uint64_t block_count =
+      (basecall_count + BASECALL_N_BLOCK_SIZE - 1) / BASECALL_N_BLOCK_SIZE;
+  result.packed_bases.original_size = packed_size;
+
+  EncodedBasecallBuffers encoded;
+  uint64_t *d_invalid_position = nullptr;
+  uint64_t invalid_position = std::numeric_limits<uint64_t>::max();
+
+  try {
+    CUDA_CHECK(cudaMalloc(&encoded.packed_bases, packed_size));
+    CUDA_CHECK(cudaMalloc(&encoded.n_counts, block_count * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&encoded.n_offsets, block_count * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_invalid_position, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_invalid_position, &invalid_position,
+                               sizeof(uint64_t), cudaMemcpyHostToDevice,
+                               stream));
+
+    const uint32_t kernel_block_size = 256;
+    count_n_basecalls_kernel<<<static_cast<uint32_t>(block_count),
+                               kernel_block_size, 0, stream>>>(
+        d_basecalls, basecall_count, encoded.n_counts, d_invalid_position);
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::exclusive_scan(thrust::cuda::par.on(stream),
+                           thrust::device_pointer_cast(encoded.n_counts),
+                           thrust::device_pointer_cast(encoded.n_counts) +
+                               block_count,
+                           thrust::device_pointer_cast(encoded.n_offsets));
+
+    std::vector<uint32_t> h_n_counts(block_count);
+    CUDA_CHECK(cudaMemcpyAsync(h_n_counts.data(), encoded.n_counts,
+                               block_count * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+
+    const uint32_t pack_grid_size = static_cast<uint32_t>(
+        (packed_size + kernel_block_size - 1) / kernel_block_size);
+    pack_basecalls_2bit_kernel<<<pack_grid_size, kernel_block_size, 0, stream>>>(
+        d_basecalls, basecall_count, encoded.packed_bases, d_invalid_position);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(&invalid_position, d_invalid_position,
+                          sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    if (invalid_position != std::numeric_limits<uint64_t>::max()) {
+      throw std::runtime_error("Encountered a non-ACGTN basecall at offset " +
+                               std::to_string(invalid_position));
+    }
+
+    uint64_t total_n_count = 0;
+    result.n_counts.resize(block_count);
+    for (uint64_t i = 0; i < block_count; ++i) {
+      if (h_n_counts[i] > BASECALL_N_BLOCK_SIZE) {
+        throw std::runtime_error("Basecall N-count overflowed its block size");
+      }
+      result.n_counts[i] = static_cast<uint16_t>(h_n_counts[i]);
+      total_n_count += h_n_counts[i];
+    }
+
+    if (total_n_count > 0) {
+      result.n_positions.original_size = total_n_count * sizeof(uint16_t);
+      CUDA_CHECK(
+          cudaMalloc(&encoded.n_positions, result.n_positions.original_size));
+      scatter_n_positions_kernel<<<static_cast<uint32_t>(block_count),
+                                   kernel_block_size, 0, stream>>>(
+          d_basecalls, basecall_count, encoded.n_offsets, encoded.n_positions,
+          d_invalid_position);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      CUDA_CHECK(cudaMemcpy(&invalid_position, d_invalid_position,
+                            sizeof(uint64_t), cudaMemcpyDeviceToHost));
+      if (invalid_position != std::numeric_limits<uint64_t>::max()) {
+        throw std::runtime_error("Encountered a non-ACGTN basecall at offset " +
+                                 std::to_string(invalid_position));
+      }
+    }
+
+    auto packed_chunks = gpu_compress_device_chunked(
+        encoded.packed_bases, packed_size, field_slice_size, nvcomp_chunk_size,
+        stream);
+    result.packed_bases.payload = std::move(packed_chunks.data);
+    result.compressed_packed_chunk_sizes = std::move(packed_chunks.chunk_sizes);
+
+    if (result.n_positions.original_size > 0) {
+      auto n_position_chunks = gpu_compress_device_chunked(
+          reinterpret_cast<const uint8_t *>(encoded.n_positions),
+          result.n_positions.original_size, field_slice_size, nvcomp_chunk_size,
+          stream);
+      result.n_positions.payload = std::move(n_position_chunks.data);
+      result.compressed_n_position_chunk_sizes =
+          std::move(n_position_chunks.chunk_sizes);
+    }
+  } catch (...) {
+    cuda_free_if_set(d_invalid_position);
+    cuda_free_if_set(encoded.n_positions);
+    cuda_free_if_set(encoded.n_offsets);
+    cuda_free_if_set(encoded.n_counts);
+    cuda_free_if_set(encoded.packed_bases);
+    throw;
+  }
+
+  cuda_free_if_set(d_invalid_position);
+  cuda_free_if_set(encoded.n_positions);
+  cuda_free_if_set(encoded.n_offsets);
+  cuda_free_if_set(encoded.n_counts);
+  cuda_free_if_set(encoded.packed_bases);
+  return result;
+}
+
+std::vector<uint8_t>
+decode_basecalls(const CompressedBasecallData &compressed,
+                 const std::vector<uint8_t> &packed_bases,
+                 const std::vector<uint8_t> &n_position_bytes) {
+  if (compressed.original_size == 0) {
+    return {};
+  }
+
+  if (compressed.n_block_size == 0) {
+    throw std::runtime_error("Decoded basecall metadata is missing block size");
+  }
+
+  const uint64_t expected_block_count =
+      (compressed.original_size + compressed.n_block_size - 1) /
+      compressed.n_block_size;
+  if (compressed.n_counts.size() != expected_block_count) {
+    throw std::runtime_error("Decoded basecall N-count metadata is invalid");
+  }
+
+  const size_t expected_packed_size =
+      static_cast<size_t>((compressed.original_size + 3) / 4);
+  if (packed_bases.size() != expected_packed_size) {
+    throw std::runtime_error("Decoded packed basecalls have an unexpected size");
+  }
+
+  uint64_t total_n_count = 0;
+  for (uint16_t count : compressed.n_counts) {
+    total_n_count += count;
+  }
+  if (n_position_bytes.size() != total_n_count * sizeof(uint16_t)) {
+    throw std::runtime_error("Decoded N-position payload has an unexpected size");
+  }
+
+  std::vector<uint8_t> basecalls(compressed.original_size);
+  static constexpr uint8_t BASECALL_DECODE_TABLE[4] = {'A', 'C', 'G', 'T'};
+  for (uint64_t index = 0; index < compressed.original_size; ++index) {
+    const uint8_t packed_value = packed_bases[index / 4];
+    const uint8_t code = static_cast<uint8_t>((packed_value >> (2 * (index % 4))) & 0x3);
+    basecalls[index] = BASECALL_DECODE_TABLE[code];
+  }
+
+  const auto *n_positions =
+      reinterpret_cast<const uint16_t *>(n_position_bytes.data());
+  uint64_t n_offset = 0;
+  for (uint64_t block_index = 0; block_index < compressed.n_counts.size();
+       ++block_index) {
+    const uint64_t block_start = block_index * compressed.n_block_size;
+    const uint64_t block_end =
+        std::min<uint64_t>(block_start + compressed.n_block_size,
+                           compressed.original_size);
+    for (uint16_t count = 0; count < compressed.n_counts[block_index]; ++count) {
+      const uint16_t local_index = n_positions[n_offset++];
+      if (block_start + local_index >= block_end) {
+        throw std::runtime_error(
+            "Decoded N-position metadata points outside its basecall block");
+      }
+      basecalls[block_start + local_index] = 'N';
+    }
+  }
+
+  return basecalls;
 }
 
 FastqData rebuild_fastq(const std::vector<uint64_t> &line_offsets,
@@ -300,7 +644,6 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   CompressedFastqData result;
   result.num_records = data.num_records;
   result.identifiers.original_size = stats.identifiers_size;
-  result.basecalls.original_size = stats.basecalls_size;
   result.quality_scores.original_size = stats.quality_scores_size;
   result.line_lengths.original_size = stats.line_length_size;
   result.line_offset_count = data.line_offsets.size();
@@ -414,13 +757,20 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
 
     std::cerr << "Compressing basecalls (" << stats.basecalls_size
               << " bytes)..." << std::endl;
-    auto seq_chunks =
-        gpu_compress_device_chunked(fields.basecalls, stats.basecalls_size,
-                                    field_slice_size, chunk_size, stream);
-    result.basecalls.payload = std::move(seq_chunks.data);
-    result.compressed_basecall_chunk_sizes = std::move(seq_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.basecalls.payload.size() << " bytes"
-              << std::endl;
+    result.basecalls = compress_basecalls_device(fields.basecalls,
+                                                 stats.basecalls_size,
+                                                 field_slice_size, chunk_size,
+                                                 stream);
+    const uint64_t compressed_basecall_size =
+        result.basecalls.packed_bases.payload.size() +
+        result.basecalls.n_positions.payload.size();
+    uint64_t total_n_count = 0;
+    for (uint16_t count : result.basecalls.n_counts) {
+      total_n_count += count;
+    }
+    std::cerr << "  Packed bases: " << result.basecalls.packed_bases.original_size
+              << " bytes, N positions: " << total_n_count << std::endl;
+    std::cerr << "  -> " << compressed_basecall_size << " bytes" << std::endl;
 
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
               << " bytes)..." << std::endl;
@@ -506,9 +856,16 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;
-  const auto basecalls = gpu_decompress_chunked(
-      compressed.basecalls.payload, compressed.compressed_basecall_chunk_sizes,
-      compressed.basecalls.original_size);
+  const auto packed_bases = gpu_decompress_chunked(
+      compressed.basecalls.packed_bases.payload,
+      compressed.basecalls.compressed_packed_chunk_sizes,
+      compressed.basecalls.packed_bases.original_size);
+  const auto n_position_bytes = gpu_decompress_chunked(
+      compressed.basecalls.n_positions.payload,
+      compressed.basecalls.compressed_n_position_chunk_sizes,
+      compressed.basecalls.n_positions.original_size);
+  const auto basecalls =
+      decode_basecalls(compressed.basecalls, packed_bases, n_position_bytes);
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;

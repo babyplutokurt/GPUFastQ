@@ -28,15 +28,24 @@ struct ZstdCompressedBlock {
   size_t original_size = 0;
 };
 
+struct CompressedBasecallData {
+  uint64_t original_size = 0;
+  uint32_t n_block_size = 0;
+  ZstdCompressedBlock packed_bases;
+  ZstdCompressedBlock n_positions;
+  std::vector<uint64_t> compressed_packed_chunk_sizes;
+  std::vector<uint64_t> compressed_n_position_chunk_sizes;
+  std::vector<uint16_t> n_counts;
+};
+
 /// Compressed FASTQ field streams plus compressed line-length metadata.
 struct CompressedFastqData {
   ZstdCompressedBlock identifiers;
-  ZstdCompressedBlock basecalls;
+  CompressedBasecallData basecalls;
   ZstdCompressedBlock quality_scores;
   ZstdCompressedBlock line_lengths;
 
   std::vector<uint64_t> compressed_identifier_chunk_sizes;
-  std::vector<uint64_t> compressed_basecall_chunk_sizes;
   std::vector<uint64_t> compressed_quality_chunk_sizes;
   std::vector<uint64_t> uncompressed_quality_chunk_sizes;
   std::vector<uint64_t> compressed_line_length_chunk_sizes;

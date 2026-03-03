@@ -32,6 +32,12 @@ void write_index(std::ofstream &f, const std::vector<uint64_t> &index) {
   }
 }
 
+void write_index16(std::ofstream &f, const std::vector<uint16_t> &index) {
+  for (uint16_t value : index) {
+    write_val(f, value);
+  }
+}
+
 std::vector<uint8_t> read_blob(std::ifstream &f, size_t size) {
   std::vector<uint8_t> data(size);
   if (size > 0) {
@@ -51,6 +57,14 @@ std::vector<uint64_t> read_index(std::ifstream &f, size_t size) {
   return index;
 }
 
+std::vector<uint16_t> read_index16(std::ifstream &f, size_t size) {
+  std::vector<uint16_t> index(size);
+  for (size_t i = 0; i < size; ++i) {
+    index[i] = read_val<uint16_t>(f);
+  }
+  return index;
+}
+
 void validate_chunked_stream(const std::vector<uint8_t> &payload,
                              size_t original_size,
                              const std::vector<uint64_t> &chunk_sizes,
@@ -62,6 +76,58 @@ void validate_chunked_stream(const std::vector<uint8_t> &payload,
     throw std::runtime_error(std::string("Cannot serialize inconsistent ") +
                              name + " chunk metadata");
   }
+}
+
+void validate_basecall_stream(const CompressedBasecallData &data) {
+  if (data.original_size == 0) {
+    const bool has_data = data.n_block_size != 0 || !data.n_counts.empty() ||
+                          data.packed_bases.original_size != 0 ||
+                          !data.packed_bases.payload.empty() ||
+                          !data.compressed_packed_chunk_sizes.empty() ||
+                          data.n_positions.original_size != 0 ||
+                          !data.n_positions.payload.empty() ||
+                          !data.compressed_n_position_chunk_sizes.empty();
+    if (has_data) {
+      throw std::runtime_error(
+          "Cannot serialize inconsistent empty basecall metadata");
+    }
+    return;
+  }
+
+  if (data.n_block_size == 0) {
+    throw std::runtime_error(
+        "Cannot serialize basecall metadata without an N-index block size");
+  }
+
+  const uint64_t expected_block_count =
+      (data.original_size + data.n_block_size - 1) / data.n_block_size;
+  if (data.n_counts.size() != expected_block_count) {
+    throw std::runtime_error(
+        "Cannot serialize basecall metadata with an unexpected N-count size");
+  }
+
+  const size_t expected_packed_size = (data.original_size + 3) / 4;
+  if (data.packed_bases.original_size != expected_packed_size) {
+    throw std::runtime_error(
+        "Cannot serialize basecall metadata with an unexpected packed size");
+  }
+
+  uint64_t total_n_count = 0;
+  for (uint16_t count : data.n_counts) {
+    total_n_count += count;
+  }
+  if (data.n_positions.original_size != total_n_count * sizeof(uint16_t)) {
+    throw std::runtime_error(
+        "Cannot serialize basecall metadata with an unexpected N-position size");
+  }
+
+  validate_chunked_stream(data.packed_bases.payload,
+                          data.packed_bases.original_size,
+                          data.compressed_packed_chunk_sizes,
+                          "packed-basecall");
+  validate_chunked_stream(data.n_positions.payload,
+                          data.n_positions.original_size,
+                          data.compressed_n_position_chunk_sizes, "N-position");
 }
 
 } // namespace
@@ -76,9 +142,7 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
                           data.identifiers.original_size,
                           data.compressed_identifier_chunk_sizes,
                           "identifier");
-  validate_chunked_stream(data.basecalls.payload,
-                          data.basecalls.original_size,
-                          data.compressed_basecall_chunk_sizes, "basecall");
+  validate_basecall_stream(data.basecalls);
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
@@ -107,10 +171,18 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file,
             static_cast<uint64_t>(data.compressed_identifier_chunk_sizes.size()));
 
-  write_val(file, static_cast<uint64_t>(data.basecalls.original_size));
-  write_val(file, static_cast<uint64_t>(data.basecalls.payload.size()));
-  write_val(file,
-            static_cast<uint64_t>(data.compressed_basecall_chunk_sizes.size()));
+  write_val(file, data.basecalls.original_size);
+  write_val(file, data.basecalls.n_block_size);
+  write_val(file, static_cast<uint64_t>(data.basecalls.n_counts.size()));
+  write_val(file, static_cast<uint64_t>(data.basecalls.packed_bases.original_size));
+  write_val(file, static_cast<uint64_t>(data.basecalls.packed_bases.payload.size()));
+  write_val(
+      file,
+      static_cast<uint64_t>(data.basecalls.compressed_packed_chunk_sizes.size()));
+  write_val(file, static_cast<uint64_t>(data.basecalls.n_positions.original_size));
+  write_val(file, static_cast<uint64_t>(data.basecalls.n_positions.payload.size()));
+  write_val(file, static_cast<uint64_t>(
+                     data.basecalls.compressed_n_position_chunk_sizes.size()));
 
   write_val(file, static_cast<uint64_t>(data.quality_scores.original_size));
   write_val(file, static_cast<uint64_t>(data.quality_scores.payload.size()));
@@ -123,13 +195,16 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
             static_cast<uint64_t>(data.compressed_line_length_chunk_sizes.size()));
 
   write_index(file, data.compressed_identifier_chunk_sizes);
-  write_index(file, data.compressed_basecall_chunk_sizes);
+  write_index(file, data.basecalls.compressed_packed_chunk_sizes);
+  write_index(file, data.basecalls.compressed_n_position_chunk_sizes);
+  write_index16(file, data.basecalls.n_counts);
   write_index(file, data.compressed_quality_chunk_sizes);
   write_index(file, data.uncompressed_quality_chunk_sizes);
   write_index(file, data.compressed_line_length_chunk_sizes);
 
   write_blob(file, data.identifiers.payload);
-  write_blob(file, data.basecalls.payload);
+  write_blob(file, data.basecalls.packed_bases.payload);
+  write_blob(file, data.basecalls.n_positions.payload);
   write_blob(file, data.quality_scores.payload);
   write_blob(file, data.line_lengths.payload);
 }
@@ -160,8 +235,14 @@ CompressedFastqData deserialize(const std::string &filepath) {
   const uint64_t comp_id_chunks = read_val<uint64_t>(file);
 
   data.basecalls.original_size = read_val<uint64_t>(file);
-  const uint64_t comp_seq_size = read_val<uint64_t>(file);
-  const uint64_t comp_seq_chunks = read_val<uint64_t>(file);
+  data.basecalls.n_block_size = read_val<uint32_t>(file);
+  const uint64_t n_count_size = read_val<uint64_t>(file);
+  data.basecalls.packed_bases.original_size = read_val<uint64_t>(file);
+  const uint64_t comp_packed_size = read_val<uint64_t>(file);
+  const uint64_t comp_packed_chunks = read_val<uint64_t>(file);
+  data.basecalls.n_positions.original_size = read_val<uint64_t>(file);
+  const uint64_t comp_n_pos_size = read_val<uint64_t>(file);
+  const uint64_t comp_n_pos_chunks = read_val<uint64_t>(file);
 
   data.quality_scores.original_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_size = read_val<uint64_t>(file);
@@ -172,13 +253,18 @@ CompressedFastqData deserialize(const std::string &filepath) {
   const uint64_t comp_index_chunks = read_val<uint64_t>(file);
 
   data.compressed_identifier_chunk_sizes = read_index(file, comp_id_chunks);
-  data.compressed_basecall_chunk_sizes = read_index(file, comp_seq_chunks);
+  data.basecalls.compressed_packed_chunk_sizes =
+      read_index(file, comp_packed_chunks);
+  data.basecalls.compressed_n_position_chunk_sizes =
+      read_index(file, comp_n_pos_chunks);
+  data.basecalls.n_counts = read_index16(file, n_count_size);
   data.compressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
   data.uncompressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
   data.compressed_line_length_chunk_sizes = read_index(file, comp_index_chunks);
 
   data.identifiers.payload = read_blob(file, comp_id_size);
-  data.basecalls.payload = read_blob(file, comp_seq_size);
+  data.basecalls.packed_bases.payload = read_blob(file, comp_packed_size);
+  data.basecalls.n_positions.payload = read_blob(file, comp_n_pos_size);
   data.quality_scores.payload = read_blob(file, comp_qual_size);
   data.line_lengths.payload = read_blob(file, comp_index_size);
 
