@@ -25,7 +25,7 @@ elapsed_ms(const std::chrono::high_resolution_clock::time_point &start,
 } // namespace
 
 int compress(const std::string &input_path, const std::string &output_path,
-             size_t bsc_threads) {
+             const BscConfig &bsc_config) {
   using clock = std::chrono::high_resolution_clock;
   const auto t0 = clock::now();
 
@@ -47,7 +47,12 @@ int compress(const std::string &input_path, const std::string &output_path,
       stats.quality_scores_size + stats.line_length_size;
 
   std::cerr << "\n=== GPU Compression ===\n";
-  const auto compressed = compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_threads);
+  if (bsc_config.backend != BscBackend::Default) {
+    std::cerr << "BSC backend:       " << bsc_backend_name(bsc_config.backend)
+              << "\n";
+  }
+  const auto compressed =
+      compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_config);
   const auto t2 = clock::now();
 
   const size_t compressed_payload_size =
@@ -79,19 +84,19 @@ int compress(const std::string &input_path, const std::string &output_path,
   return 0;
 }
 
-int roundtrip(const std::string &input_path, size_t bsc_threads) {
+int roundtrip(const std::string &input_path, const BscConfig &bsc_config) {
   std::cerr << "=== Round-trip verification ===\n";
 
   const auto original = parse_fastq(input_path);
   std::cerr << "Parsed " << original.num_records << " records\n";
 
   const auto compressed =
-      compress_fastq(original, DEFAULT_CHUNK_SIZE, bsc_threads);
+      compress_fastq(original, DEFAULT_CHUNK_SIZE, bsc_config);
 
   const std::string tmp_path = input_path + ".gpufq.tmp";
   serialize(tmp_path, compressed);
   const auto loaded = deserialize(tmp_path);
-  const auto decoded = decompress_fastq(loaded, bsc_threads);
+  const auto decoded = decompress_fastq(loaded, bsc_config);
 
   bool ok = true;
   if (original.num_records != decoded.num_records) {

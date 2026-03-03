@@ -20,7 +20,7 @@ long long elapsed_ms(const std::chrono::high_resolution_clock::time_point &start
 } // namespace
 
 int decompress(const std::string &input_path, const std::string &output_path,
-               size_t bsc_threads) {
+               const BscConfig &bsc_config) {
   using clock = std::chrono::high_resolution_clock;
   const auto t0 = clock::now();
 
@@ -31,7 +31,11 @@ int decompress(const std::string &input_path, const std::string &output_path,
   std::cerr << "Records: " << compressed.num_records << "\n";
 
   std::cerr << "\n=== GPU Decompression ===\n";
-  const auto data = decompress_fastq(compressed, bsc_threads);
+  if (bsc_config.backend != BscBackend::Default) {
+    std::cerr << "BSC backend:       " << bsc_backend_name(bsc_config.backend)
+              << "\n";
+  }
+  const auto data = decompress_fastq(compressed, bsc_config);
   const auto t2 = clock::now();
 
   std::cerr << "\n=== Writing FASTQ: " << output_path << " ===\n";

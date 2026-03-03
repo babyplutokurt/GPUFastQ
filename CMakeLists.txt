@@ -22,6 +22,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(OpenMP REQUIRED)
 # ============================================================
 # nvcomp Configuration
 # Usage: -DNVCOMP_ROOT=/path/to/nvcomp
@@ -92,8 +93,8 @@ add_library(gpufastq_lib
     src/serializer.cpp
 )
 
-set(BSC_ENABLE_CUDA OFF CACHE BOOL "Disable libbsc CUDA support in submodule build" FORCE)
-set(BSC_ENABLE_OPENMP OFF CACHE BOOL "Disable libbsc OpenMP support in submodule build" FORCE)
+set(BSC_ENABLE_CUDA ON CACHE BOOL "Enable libbsc CUDA support in submodule build" FORCE)
+set(BSC_ENABLE_OPENMP ON CACHE BOOL "Enable libbsc OpenMP support in submodule build" FORCE)
 set(BSC_BUILD_SHARED_LIB OFF CACHE BOOL "Build libbsc as a static library" FORCE)
 add_subdirectory(deps/libbsc deps/libbsc-build EXCLUDE_FROM_ALL)
 
@@ -102,6 +103,11 @@ set(PROJECT_RUNTIME_RPATH
     "/usr/local/lib"
     "$<TARGET_FILE_DIR:CUDA::cudart>"
 )
+
+if(OpenMP_gomp_LIBRARY)
+    get_filename_component(OPENMP_RUNTIME_DIR "${OpenMP_gomp_LIBRARY}" DIRECTORY)
+    list(APPEND PROJECT_RUNTIME_RPATH "${OPENMP_RUNTIME_DIR}")
+endif()
 
 list(REMOVE_DUPLICATES PROJECT_RUNTIME_RPATH)
 

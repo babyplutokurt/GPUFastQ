@@ -2,11 +2,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace gpufastq {
 
-constexpr size_t BSC_QUALITY_CHUNK_SIZE = 8 * 1024 * 1024;
+constexpr size_t BSC_QUALITY_CHUNK_SIZE = 32 * 1024 * 1024;
+
+enum class BscBackend {
+  Default,
+  Cpu,
+  Cuda,
+};
+
+struct BscConfig {
+  BscBackend backend = BscBackend::Default;
+  size_t threads = 0;
+  size_t gpu_jobs = 0;
+};
 
 struct BscChunkedBuffer {
   std::vector<uint8_t> data;
@@ -14,14 +27,17 @@ struct BscChunkedBuffer {
   std::vector<uint64_t> uncompressed_chunk_sizes;
 };
 
-BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
-                                      size_t chunk_size = BSC_QUALITY_CHUNK_SIZE,
-                                      size_t num_threads = 0);
+std::string_view bsc_backend_name(BscBackend backend);
+
+BscChunkedBuffer
+bsc_compress_chunked(const uint8_t *input, size_t input_size,
+                     size_t chunk_size = BSC_QUALITY_CHUNK_SIZE,
+                     const BscConfig &config = {});
 
 std::vector<uint8_t>
 bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
                        const std::vector<uint64_t> &compressed_chunk_sizes,
                        const std::vector<uint64_t> &uncompressed_chunk_sizes,
-                       uint64_t expected_size, size_t num_threads = 0);
+                       uint64_t expected_size, const BscConfig &config = {});
 
 } // namespace gpufastq
