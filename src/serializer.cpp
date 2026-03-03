@@ -82,6 +82,16 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
+  if ((!data.compressed_quality_chunk_sizes.empty()) !=
+      (!data.uncompressed_quality_chunk_sizes.empty())) {
+    throw std::runtime_error(
+        "Cannot serialize inconsistent quality chunk size metadata");
+  }
+  if (data.compressed_quality_chunk_sizes.size() !=
+      data.uncompressed_quality_chunk_sizes.size()) {
+    throw std::runtime_error(
+        "Cannot serialize mismatched quality chunk size vectors");
+  }
   validate_chunked_stream(data.line_lengths.payload,
                           data.line_lengths.original_size,
                           data.compressed_line_length_chunk_sizes,
@@ -115,6 +125,7 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_index(file, data.compressed_identifier_chunk_sizes);
   write_index(file, data.compressed_basecall_chunk_sizes);
   write_index(file, data.compressed_quality_chunk_sizes);
+  write_index(file, data.uncompressed_quality_chunk_sizes);
   write_index(file, data.compressed_line_length_chunk_sizes);
 
   write_blob(file, data.identifiers.payload);
@@ -163,6 +174,7 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.compressed_identifier_chunk_sizes = read_index(file, comp_id_chunks);
   data.compressed_basecall_chunk_sizes = read_index(file, comp_seq_chunks);
   data.compressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
+  data.uncompressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
   data.compressed_line_length_chunk_sizes = read_index(file, comp_index_chunks);
 
   data.identifiers.payload = read_blob(file, comp_id_size);

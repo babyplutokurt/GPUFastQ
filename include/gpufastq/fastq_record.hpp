@@ -38,6 +38,7 @@ struct CompressedFastqData {
   std::vector<uint64_t> compressed_identifier_chunk_sizes;
   std::vector<uint64_t> compressed_basecall_chunk_sizes;
   std::vector<uint64_t> compressed_quality_chunk_sizes;
+  std::vector<uint64_t> uncompressed_quality_chunk_sizes;
   std::vector<uint64_t> compressed_line_length_chunk_sizes;
 
   uint64_t line_offset_count = 0;

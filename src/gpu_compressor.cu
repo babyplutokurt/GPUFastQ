@@ -1,3 +1,4 @@
+#include "gpufastq/codec_bsc.hpp"
 #include "gpufastq/codec_gpu.cuh"
 #include "gpufastq/codec_gpu_nvcomp.cuh"
 #include "gpufastq/fastq_parser.hpp"
@@ -12,8 +13,6 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
-
-#include <libbsc/libbsc.h>
 
 namespace gpufastq {
 
@@ -106,73 +105,6 @@ __global__ void gather_fields_kernel(
   for (uint64_t i = 0; i < quality_lengths[idx]; ++i) {
     quality_scores[qual_dst + i] = raw_bytes[qual_src + i];
   }
-}
-
-ChunkedCompressedBuffer bsc_compress_host_chunked(const uint8_t *h_input,
-                                                  size_t input_size,
-                                                  size_t chunk_size) {
-  ChunkedCompressedBuffer result;
-  if (input_size == 0) {
-    return result;
-  }
-
-  bsc_init(LIBBSC_FEATURE_FASTMODE);
-
-  for (size_t offset = 0; offset < input_size; offset += chunk_size) {
-    int target_chunk_size =
-        static_cast<int>(std::min(chunk_size, input_size - offset));
-    int max_compressed_size = target_chunk_size + LIBBSC_HEADER_SIZE;
-    std::vector<uint8_t> compressed(max_compressed_size);
-
-    int compressed_size =
-        bsc_compress(h_input + offset, compressed.data(), target_chunk_size, 16,
-                     128, LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE,
-                     LIBBSC_FEATURE_FASTMODE);
-
-    if (compressed_size < LIBBSC_NO_ERROR) {
-      throw std::runtime_error("BSC compression failed with code: " +
-                               std::to_string(compressed_size));
-    }
-
-    result.chunk_sizes.push_back(compressed_size);
-    result.data.insert(result.data.end(), compressed.data(),
-                       compressed.data() + compressed_size);
-  }
-  return result;
-}
-
-std::vector<uint8_t>
-bsc_decompress_host_chunked(const std::vector<uint8_t> &compressed,
-                            const std::vector<uint64_t> &chunk_sizes,
-                            uint64_t expected_size) {
-
-  if (compressed.empty())
-    return {};
-
-  bsc_init(LIBBSC_FEATURE_FASTMODE);
-
-  std::vector<uint8_t> output(expected_size);
-  size_t compressed_offset = 0;
-  size_t uncompressed_offset = 0;
-
-  for (uint64_t chunk_size : chunk_sizes) {
-    int expected_chunk_size = static_cast<int>(std::min<uint64_t>(
-        8 * 1024 * 1024, expected_size - uncompressed_offset));
-
-    int decomp_result = bsc_decompress(
-        compressed.data() + compressed_offset, static_cast<int>(chunk_size),
-        output.data() + uncompressed_offset, expected_chunk_size,
-        LIBBSC_FEATURE_FASTMODE);
-
-    if (decomp_result != LIBBSC_NO_ERROR && decomp_result < 0) {
-      throw std::runtime_error("BSC decompression failed with code: " +
-                               std::to_string(decomp_result));
-    }
-
-    compressed_offset += chunk_size;
-    uncompressed_offset += expected_chunk_size;
-  }
-  return output;
 }
 
 ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
@@ -498,10 +430,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    auto qual_chunks = bsc_compress_host_chunked(
-        h_quality_scores.data(), stats.quality_scores_size, 8 * 1024 * 1024);
+    auto qual_chunks = bsc_compress_chunked(h_quality_scores.data(),
+                                            stats.quality_scores_size,
+                                            BSC_QUALITY_CHUNK_SIZE);
     result.quality_scores.payload = std::move(qual_chunks.data);
-    result.compressed_quality_chunk_sizes = std::move(qual_chunks.chunk_sizes);
+    result.compressed_quality_chunk_sizes =
+        std::move(qual_chunks.compressed_chunk_sizes);
+    result.uncompressed_quality_chunk_sizes =
+        std::move(qual_chunks.uncompressed_chunk_sizes);
     std::cerr << "  -> " << result.quality_scores.payload.size() << " bytes"
               << std::endl;
 
@@ -563,10 +499,11 @@ FastqData decompress_fastq(const CompressedFastqData &compressed) {
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
-  const auto quality_scores =
-      bsc_decompress_host_chunked(compressed.quality_scores.payload,
-                                  compressed.compressed_quality_chunk_sizes,
-                                  compressed.quality_scores.original_size);
+  const auto quality_scores = bsc_decompress_chunked(
+      compressed.quality_scores.payload,
+      compressed.compressed_quality_chunk_sizes,
+      compressed.uncompressed_quality_chunk_sizes,
+      compressed.quality_scores.original_size);
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing line lengths..." << std::endl;
