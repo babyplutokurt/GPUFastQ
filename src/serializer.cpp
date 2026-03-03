@@ -89,6 +89,10 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
   validate_chunked_stream(column.values.payload, column.values.original_size,
                           column.compressed_value_chunk_sizes,
                           "identifier-column-values");
+  if (column.raw_text_size == 0 && num_records != 0) {
+    throw std::runtime_error(
+        "Cannot serialize identifier column without raw text size");
+  }
   if (column.kind == IdentifierColumnKind::String) {
     if (column.encoding != IdentifierColumnEncoding::Plain) {
       throw std::runtime_error(
@@ -108,13 +112,21 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
     throw std::runtime_error("Cannot serialize unknown identifier column kind");
   }
   if (column.encoding != IdentifierColumnEncoding::Plain &&
-      column.encoding != IdentifierColumnEncoding::Delta) {
+      column.encoding != IdentifierColumnEncoding::Delta &&
+      column.encoding != IdentifierColumnEncoding::DeltaVarint) {
     throw std::runtime_error(
         "Cannot serialize numeric identifier column with unknown encoding");
   }
-  if (column.values.original_size != num_records * sizeof(int32_t)) {
+  if ((column.encoding == IdentifierColumnEncoding::Plain ||
+       column.encoding == IdentifierColumnEncoding::Delta) &&
+      column.values.original_size != num_records * sizeof(int32_t)) {
     throw std::runtime_error(
-        "Cannot serialize numeric identifier column with invalid value size");
+        "Cannot serialize fixed-width numeric identifier column with invalid value size");
+  }
+  if (column.encoding == IdentifierColumnEncoding::DeltaVarint &&
+      column.values.original_size == 0 && num_records != 0) {
+    throw std::runtime_error(
+        "Cannot serialize delta-varint numeric identifier column with empty values");
   }
   if (column.lengths.original_size != 0 || !column.lengths.payload.empty() ||
       !column.compressed_length_chunk_sizes.empty()) {
@@ -291,6 +303,7 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   for (const auto &column : data.identifiers.columns) {
     write_val(file, static_cast<uint8_t>(column.kind));
     write_val(file, static_cast<uint8_t>(column.encoding));
+    write_val(file, static_cast<uint64_t>(column.raw_text_size));
     write_val(file, static_cast<uint64_t>(column.values.original_size));
     write_val(file, static_cast<uint64_t>(column.values.payload.size()));
     write_val(file,
@@ -392,6 +405,7 @@ CompressedFastqData deserialize(const std::string &filepath) {
     column.kind = static_cast<IdentifierColumnKind>(read_val<uint8_t>(file));
     column.encoding =
         static_cast<IdentifierColumnEncoding>(read_val<uint8_t>(file));
+    column.raw_text_size = read_val<uint64_t>(file);
     column.values.original_size = read_val<uint64_t>(file);
     const uint64_t value_payload_size = read_val<uint64_t>(file);
     const uint64_t value_chunk_count = read_val<uint64_t>(file);

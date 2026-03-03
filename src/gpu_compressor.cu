@@ -46,6 +46,7 @@ struct TokenizedIdentifier {
 
 struct IdentifierColumnBuffers {
   IdentifierColumnKind kind = IdentifierColumnKind::String;
+  uint64_t raw_text_size = 0;
   std::vector<uint8_t> string_values;
   std::vector<uint32_t> string_lengths;
   std::vector<int32_t> int_values;
@@ -89,6 +90,8 @@ const char *identifier_column_encoding_name(IdentifierColumnEncoding encoding) {
     return "plain";
   case IdentifierColumnEncoding::Delta:
     return "delta";
+  case IdentifierColumnEncoding::DeltaVarint:
+    return "delta-varint";
   }
   return "unknown";
 }
@@ -235,6 +238,60 @@ std::vector<int32_t> delta_decode_int32(const int32_t *values, size_t count) {
   return decoded;
 }
 
+uint32_t zigzag_encode_int32(int32_t value) {
+  return (static_cast<uint32_t>(value) << 1) ^
+         static_cast<uint32_t>(value >> 31);
+}
+
+int32_t zigzag_decode_int32(uint32_t value) {
+  return static_cast<int32_t>((value >> 1) ^
+                              static_cast<uint32_t>(-static_cast<int32_t>(value & 1)));
+}
+
+std::vector<uint8_t> encode_varint_u32(const std::vector<int32_t> &values) {
+  std::vector<uint8_t> bytes;
+  bytes.reserve(values.size() * 2);
+  for (int32_t value : values) {
+    uint32_t encoded = zigzag_encode_int32(value);
+    while (encoded >= 0x80u) {
+      bytes.push_back(static_cast<uint8_t>(encoded) | 0x80u);
+      encoded >>= 7;
+    }
+    bytes.push_back(static_cast<uint8_t>(encoded));
+  }
+  return bytes;
+}
+
+std::vector<int32_t> decode_varint_u32(const std::vector<uint8_t> &bytes,
+                                       size_t expected_count) {
+  std::vector<int32_t> values;
+  values.reserve(expected_count);
+
+  uint32_t current = 0;
+  uint32_t shift = 0;
+  for (uint8_t byte : bytes) {
+    current |= static_cast<uint32_t>(byte & 0x7fu) << shift;
+    if ((byte & 0x80u) == 0) {
+      values.push_back(zigzag_decode_int32(current));
+      current = 0;
+      shift = 0;
+      continue;
+    }
+    shift += 7;
+    if (shift >= 35) {
+      throw std::runtime_error("Identifier varint payload is malformed");
+    }
+  }
+
+  if (shift != 0) {
+    throw std::runtime_error("Identifier varint payload ended mid-value");
+  }
+  if (values.size() != expected_count) {
+    throw std::runtime_error("Identifier varint payload decoded an unexpected count");
+  }
+  return values;
+}
+
 template <typename T> void cuda_free_if_set(T *ptr) {
   if (ptr != nullptr) {
     cudaFree(ptr);
@@ -334,6 +391,7 @@ CompressedIdentifierData compress_identifiers_columnar(
         if (token.size() > std::numeric_limits<uint32_t>::max()) {
           throw std::runtime_error("Identifier token length exceeds uint32_t");
         }
+        columns[i].raw_text_size += token.size();
         columns[i].string_lengths.push_back(static_cast<uint32_t>(token.size()));
         columns[i].string_values.insert(columns[i].string_values.end(),
                                         token.begin(), token.end());
@@ -341,6 +399,7 @@ CompressedIdentifierData compress_identifiers_columnar(
         if (!token_is_int32(tokenized.tokens[i])) {
           return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
         }
+        columns[i].raw_text_size += tokenized.tokens[i].size();
         columns[i].int_values.push_back(parse_int32_token(tokenized.tokens[i]));
       }
     }
@@ -356,6 +415,7 @@ CompressedIdentifierData compress_identifiers_columnar(
   for (size_t i = 0; i < columns.size(); ++i) {
     auto &out = result.columns[i];
     out.kind = columns[i].kind;
+    out.raw_text_size = columns[i].raw_text_size;
     if (out.kind == IdentifierColumnKind::String) {
       out.encoding = IdentifierColumnEncoding::Plain;
       out.values.original_size = columns[i].string_values.size();
@@ -380,19 +440,34 @@ CompressedIdentifierData compress_identifiers_columnar(
       const auto plain_bytes = int32_vector_to_bytes(columns[i].int_values);
       const auto delta_values = delta_encode_int32(columns[i].int_values);
       const auto delta_bytes = int32_vector_to_bytes(delta_values);
+      const auto delta_varint_bytes = encode_varint_u32(delta_values);
 
       auto plain_chunks =
           host_compress_chunked(plain_bytes, field_slice_size, nvcomp_chunk_size);
       auto delta_chunks =
           host_compress_chunked(delta_bytes, field_slice_size, nvcomp_chunk_size);
+      auto delta_varint_chunks = host_compress_chunked(
+          delta_varint_bytes, field_slice_size, nvcomp_chunk_size);
 
-      out.values.original_size = plain_bytes.size();
-      if (sum_sizes(delta_chunks.chunk_sizes) < sum_sizes(plain_chunks.chunk_sizes)) {
+      const uint64_t plain_size = sum_sizes(plain_chunks.chunk_sizes);
+      const uint64_t delta_size = sum_sizes(delta_chunks.chunk_sizes);
+      const uint64_t delta_varint_size =
+          sum_sizes(delta_varint_chunks.chunk_sizes);
+
+      if (delta_varint_size < delta_size && delta_varint_size < plain_size) {
+        out.encoding = IdentifierColumnEncoding::DeltaVarint;
+        out.values.original_size = delta_varint_bytes.size();
+        out.values.payload = std::move(delta_varint_chunks.data);
+        out.compressed_value_chunk_sizes =
+            std::move(delta_varint_chunks.chunk_sizes);
+      } else if (delta_size < plain_size) {
         out.encoding = IdentifierColumnEncoding::Delta;
+        out.values.original_size = plain_bytes.size();
         out.values.payload = std::move(delta_chunks.data);
         out.compressed_value_chunk_sizes = std::move(delta_chunks.chunk_sizes);
       } else {
         out.encoding = IdentifierColumnEncoding::Plain;
+        out.values.original_size = plain_bytes.size();
         out.values.payload = std::move(plain_chunks.data);
         out.compressed_value_chunk_sizes = std::move(plain_chunks.chunk_sizes);
       }
@@ -451,18 +526,26 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
                     length_bytes.size());
       }
     } else {
-      if (columns[i].value_bytes.size() != num_records * sizeof(int32_t)) {
-        throw std::runtime_error(
-            "Decoded identifier numeric payload has an unexpected size");
-      }
-      const auto *encoded_values =
-          reinterpret_cast<const int32_t *>(columns[i].value_bytes.data());
-      if (columns[i].encoding == IdentifierColumnEncoding::Delta) {
-        columns[i].decoded_int_values =
-            delta_decode_int32(encoded_values, static_cast<size_t>(num_records));
+      if (columns[i].encoding == IdentifierColumnEncoding::DeltaVarint) {
+        auto delta_values = decode_varint_u32(columns[i].value_bytes,
+                                              static_cast<size_t>(num_records));
+        columns[i].decoded_int_values = delta_decode_int32(
+            delta_values.data(), static_cast<size_t>(num_records));
         columns[i].int_values = columns[i].decoded_int_values.data();
       } else {
-        columns[i].int_values = encoded_values;
+        if (columns[i].value_bytes.size() != num_records * sizeof(int32_t)) {
+          throw std::runtime_error(
+              "Decoded identifier numeric payload has an unexpected size");
+        }
+        const auto *encoded_values =
+            reinterpret_cast<const int32_t *>(columns[i].value_bytes.data());
+        if (columns[i].encoding == IdentifierColumnEncoding::Delta) {
+          columns[i].decoded_int_values = delta_decode_int32(
+              encoded_values, static_cast<size_t>(num_records));
+          columns[i].int_values = columns[i].decoded_int_values.data();
+        } else {
+          columns[i].int_values = encoded_values;
+        }
       }
     }
   }
@@ -1219,7 +1302,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                   << std::endl;
         for (size_t i = 0; i < result.identifiers.columns.size(); ++i) {
           const auto &column = result.identifiers.columns[i];
-          const uint64_t raw_value_size = column.values.original_size;
+          const uint64_t raw_value_size = column.raw_text_size;
           const uint64_t comp_value_size = column.values.payload.size();
           const uint64_t raw_length_size = column.lengths.original_size;
           const uint64_t comp_length_size = column.lengths.payload.size();
