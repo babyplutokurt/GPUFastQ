@@ -134,6 +134,14 @@ std::string_view bsc_backend_name(BscBackend backend) {
   return "unknown";
 }
 
+ResolvedBscConfig resolve_bsc_config(const BscConfig &config, size_t task_count) {
+  const BscBackend backend = resolve_backend(config.backend);
+  return ResolvedBscConfig{
+      backend,
+      resolve_parallelism(config, task_count, backend),
+  };
+}
+
 BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
                                       size_t chunk_size,
                                       const BscConfig &config) {
@@ -148,11 +156,12 @@ BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
     throw std::runtime_error("BSC compression chunk size must be non-zero");
   }
 
-  const BscBackend backend = resolve_backend(config.backend);
+  const size_t chunk_count = (input_size + chunk_size - 1) / chunk_size;
+  const auto resolved = resolve_bsc_config(config, chunk_count);
+  const BscBackend backend = resolved.backend;
   const int features = bsc_features_for_backend(backend);
   bsc_check_init(backend);
 
-  const size_t chunk_count = (input_size + chunk_size - 1) / chunk_size;
   std::vector<std::vector<uint8_t>> compressed_chunks(chunk_count);
   result.compressed_chunk_sizes.resize(chunk_count);
   result.uncompressed_chunk_sizes.resize(chunk_count);
@@ -161,7 +170,7 @@ BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
   std::exception_ptr worker_error;
   std::atomic<bool> failed{false};
   std::mutex error_mutex;
-  const size_t worker_count = resolve_parallelism(config, chunk_count, backend);
+  const size_t worker_count = resolved.parallelism;
 
   const auto worker = [&]() {
     try {
@@ -248,7 +257,9 @@ bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
     throw std::runtime_error("BSC chunk metadata sizes do not match");
   }
 
-  const BscBackend backend = resolve_backend(config.backend);
+  const auto resolved =
+      resolve_bsc_config(config, compressed_chunk_sizes.size());
+  const BscBackend backend = resolved.backend;
   const int features = bsc_features_for_backend(backend);
   bsc_check_init(backend);
 
@@ -289,8 +300,7 @@ bsc_decompress_chunked(const std::vector<uint8_t> &compressed,
   std::exception_ptr worker_error;
   std::atomic<bool> failed{false};
   std::mutex error_mutex;
-  const size_t worker_count =
-      resolve_parallelism(config, compressed_chunk_sizes.size(), backend);
+  const size_t worker_count = resolved.parallelism;
 
   const auto worker = [&]() {
     try {

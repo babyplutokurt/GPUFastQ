@@ -21,6 +21,11 @@ struct BscConfig {
   size_t gpu_jobs = 0;
 };
 
+struct ResolvedBscConfig {
+  BscBackend backend = BscBackend::Cpu;
+  size_t parallelism = 1;
+};
+
 struct BscChunkedBuffer {
   std::vector<uint8_t> data;
   std::vector<uint64_t> compressed_chunk_sizes;
@@ -28,6 +33,8 @@ struct BscChunkedBuffer {
 };
 
 std::string_view bsc_backend_name(BscBackend backend);
+
+ResolvedBscConfig resolve_bsc_config(const BscConfig &config, size_t task_count);
 
 BscChunkedBuffer
 bsc_compress_chunked(const uint8_t *input, size_t input_size,

@@ -424,6 +424,16 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
 
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
               << " bytes)..." << std::endl;
+    const size_t quality_chunk_count =
+        stats.quality_scores_size == 0
+            ? 0
+            : (stats.quality_scores_size + BSC_QUALITY_CHUNK_SIZE - 1) /
+                  BSC_QUALITY_CHUNK_SIZE;
+    const auto resolved_bsc =
+        resolve_bsc_config(bsc_config, quality_chunk_count);
+    std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
+              << ", jobs: " << resolved_bsc.parallelism
+              << ", chunks: " << quality_chunk_count << std::endl;
     std::vector<uint8_t> h_quality_scores(stats.quality_scores_size);
     if (stats.quality_scores_size > 0) {
       CUDA_CHECK(cudaMemcpyAsync(h_quality_scores.data(), fields.quality_scores,
@@ -502,6 +512,12 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
+  const auto resolved_bsc = resolve_bsc_config(
+      bsc_config, compressed.compressed_quality_chunk_sizes.size());
+  std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
+            << ", jobs: " << resolved_bsc.parallelism
+            << ", chunks: " << compressed.compressed_quality_chunk_sizes.size()
+            << std::endl;
   const auto quality_scores = bsc_decompress_chunked(
       compressed.quality_scores.payload,
       compressed.compressed_quality_chunk_sizes,
