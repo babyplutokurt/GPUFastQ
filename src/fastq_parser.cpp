@@ -1,4 +1,5 @@
 #include "gpufastq/fastq_parser.hpp"
+#include "gpufastq/codec_gpu.cuh"
 
 #include <cctype>
 #include <fstream>
@@ -273,6 +274,11 @@ FastqData parse_fastq(const std::string &filepath) {
   data.num_records = (data.line_offsets.size() - 1) / 4;
 
   validate_fastq_layout(data);
+  const auto quality_analysis =
+      analyze_quality_lengths(data.line_offsets, data.num_records);
+  data.quality_lengths = quality_analysis.lengths;
+  data.quality_layout = quality_analysis.layout;
+  data.fixed_quality_length = quality_analysis.fixed_length;
   data.identifier_layout = discover_identifier_layout(data);
   return data;
 }
@@ -293,11 +299,20 @@ FastqFieldStats compute_field_stats(const FastqData &data) {
   for (uint64_t record = 0; record < data.num_records; ++record) {
     const uint64_t id_line = 4 * record;
     const uint64_t seq_line = id_line + 1;
-    const uint64_t qual_line = id_line + 3;
 
     stats.identifiers_size += line_content_length(data.line_offsets, id_line) - 1;
     stats.basecalls_size += line_content_length(data.line_offsets, seq_line);
-    stats.quality_scores_size += line_content_length(data.line_offsets, qual_line);
+  }
+
+  if (data.quality_lengths.size() == static_cast<size_t>(data.num_records)) {
+    for (uint32_t quality_length : data.quality_lengths) {
+      stats.quality_scores_size += quality_length;
+    }
+  } else {
+    for (uint64_t record = 0; record < data.num_records; ++record) {
+      const uint64_t qual_line = 4 * record + 3;
+      stats.quality_scores_size += line_content_length(data.line_offsets, qual_line);
+    }
   }
 
   return stats;

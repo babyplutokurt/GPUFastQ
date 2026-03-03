@@ -29,6 +29,11 @@ struct IdentifierLayout {
   std::vector<IdentifierColumnKind> column_kinds;
 };
 
+enum class QualityLayoutKind : uint8_t {
+  FixedLength = 0,
+  VariableLength = 1,
+};
+
 /// Raw FASTQ bytes plus line-start indices.
 struct FastqData {
   /// Full FASTQ byte stream.
@@ -37,6 +42,12 @@ struct FastqData {
   std::vector<uint64_t> line_offsets;
   /// Number of four-line FASTQ records.
   uint64_t num_records = 0;
+  /// Per-record quality line lengths in bases.
+  std::vector<uint32_t> quality_lengths;
+  /// Whether all quality lines share the same length.
+  QualityLayoutKind quality_layout = QualityLayoutKind::FixedLength;
+  /// Valid when quality_layout is FixedLength, otherwise 0.
+  uint32_t fixed_quality_length = 0;
   /// Discovered identifier layout from the initial FASTQ sample.
   IdentifierLayout identifier_layout;
 };

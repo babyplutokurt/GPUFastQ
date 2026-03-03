@@ -49,7 +49,15 @@ int compress(const std::string &input_path, const std::string &output_path,
             << "  Identifiers:     " << stats.identifiers_size << " B\n"
             << "  Basecalls:       " << stats.basecalls_size << " B\n"
             << "  Quality scores:  " << stats.quality_scores_size << " B\n"
-            << "  Line lengths:    " << stats.line_length_size << " B\n";
+            << "  Line lengths:    " << stats.line_length_size << " B\n"
+            << "  Quality layout:  "
+            << (data.quality_layout == QualityLayoutKind::FixedLength
+                    ? "fixed"
+                    : "variable");
+  if (data.quality_layout == QualityLayoutKind::FixedLength) {
+    std::cerr << " (" << data.fixed_quality_length << " bases)";
+  }
+  std::cerr << "\n";
 
   const size_t raw_payload_size =
       stats.identifiers_size + stats.basecalls_size +
@@ -100,6 +108,14 @@ int roundtrip(const std::string &input_path, const BscConfig &bsc_config) {
 
   const auto original = parse_fastq(input_path);
   std::cerr << "Parsed " << original.num_records << " records\n";
+  std::cerr << "Quality layout: "
+            << (original.quality_layout == QualityLayoutKind::FixedLength
+                    ? "fixed"
+                    : "variable");
+  if (original.quality_layout == QualityLayoutKind::FixedLength) {
+    std::cerr << " (" << original.fixed_quality_length << " bases)";
+  }
+  std::cerr << "\n";
 
   const auto compressed =
       compress_fastq(original, DEFAULT_CHUNK_SIZE, bsc_config);
