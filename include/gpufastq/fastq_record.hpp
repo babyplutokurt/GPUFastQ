@@ -2,9 +2,26 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace gpufastq {
+
+enum class IdentifierColumnKind : uint8_t {
+  String = 0,
+  Int32 = 1,
+};
+
+enum class IdentifierCompressionMode : uint8_t {
+  Flat = 0,
+  Columnar = 1,
+};
+
+struct IdentifierLayout {
+  bool columnar = false;
+  std::vector<std::string> separators;
+  std::vector<IdentifierColumnKind> column_kinds;
+};
 
 /// Raw FASTQ bytes plus line-start indices.
 struct FastqData {
@@ -14,6 +31,8 @@ struct FastqData {
   std::vector<uint64_t> line_offsets;
   /// Number of four-line FASTQ records.
   uint64_t num_records = 0;
+  /// Discovered identifier layout from the initial FASTQ sample.
+  IdentifierLayout identifier_layout;
 };
 
 struct FastqFieldStats {
@@ -28,6 +47,23 @@ struct ZstdCompressedBlock {
   size_t original_size = 0;
 };
 
+struct CompressedIdentifierColumn {
+  IdentifierColumnKind kind = IdentifierColumnKind::String;
+  ZstdCompressedBlock values;
+  ZstdCompressedBlock lengths;
+  std::vector<uint64_t> compressed_value_chunk_sizes;
+  std::vector<uint64_t> compressed_length_chunk_sizes;
+};
+
+struct CompressedIdentifierData {
+  IdentifierCompressionMode mode = IdentifierCompressionMode::Flat;
+  uint64_t original_size = 0;
+  IdentifierLayout layout;
+  ZstdCompressedBlock flat_data;
+  std::vector<uint64_t> compressed_flat_chunk_sizes;
+  std::vector<CompressedIdentifierColumn> columns;
+};
+
 struct CompressedBasecallData {
   uint64_t original_size = 0;
   uint32_t n_block_size = 0;
@@ -40,12 +76,11 @@ struct CompressedBasecallData {
 
 /// Compressed FASTQ field streams plus compressed line-length metadata.
 struct CompressedFastqData {
-  ZstdCompressedBlock identifiers;
+  CompressedIdentifierData identifiers;
   CompressedBasecallData basecalls;
   ZstdCompressedBlock quality_scores;
   ZstdCompressedBlock line_lengths;
 
-  std::vector<uint64_t> compressed_identifier_chunk_sizes;
   std::vector<uint64_t> compressed_quality_chunk_sizes;
   std::vector<uint64_t> uncompressed_quality_chunk_sizes;
   std::vector<uint64_t> compressed_line_length_chunk_sizes;

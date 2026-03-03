@@ -22,6 +22,15 @@ elapsed_ms(const std::chrono::high_resolution_clock::time_point &start,
       .count();
 }
 
+size_t compressed_identifier_size(const CompressedIdentifierData &identifiers) {
+  size_t total = identifiers.flat_data.payload.size();
+  for (const auto &column : identifiers.columns) {
+    total += column.values.payload.size();
+    total += column.lengths.payload.size();
+  }
+  return total;
+}
+
 } // namespace
 
 int compress(const std::string &input_path, const std::string &output_path,
@@ -56,8 +65,9 @@ int compress(const std::string &input_path, const std::string &output_path,
   const auto t2 = clock::now();
 
   const size_t compressed_payload_size =
-      compressed.identifiers.payload.size() +
+      compressed_identifier_size(compressed.identifiers) +
       compressed.basecalls.packed_bases.payload.size() +
+      compressed.basecalls.n_counts.payload.size() +
       compressed.basecalls.n_positions.payload.size() +
       compressed.quality_scores.payload.size() +
       compressed.line_lengths.payload.size();

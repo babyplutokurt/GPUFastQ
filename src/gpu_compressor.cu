@@ -9,6 +9,7 @@
 #include <thrust/scan.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -38,6 +39,23 @@ struct ChunkedCompressedBuffer {
   std::vector<uint64_t> chunk_sizes;
 };
 
+struct TokenizedIdentifier {
+  std::vector<std::string> tokens;
+  std::vector<std::string> separators;
+};
+
+struct IdentifierColumnBuffers {
+  IdentifierColumnKind kind = IdentifierColumnKind::String;
+  std::vector<uint8_t> string_values;
+  std::vector<uint32_t> string_lengths;
+  std::vector<int32_t> int_values;
+};
+
+std::vector<uint8_t>
+gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
+                       const std::vector<uint64_t> &chunk_sizes,
+                       uint64_t expected_size);
+
 struct DeviceFieldBuffers {
   uint8_t *identifiers = nullptr;
   uint8_t *basecalls = nullptr;
@@ -55,10 +73,355 @@ uint64_t sum_sizes(const std::vector<uint64_t> &sizes) {
   return std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
 }
 
+const char *identifier_column_kind_name(IdentifierColumnKind kind) {
+  switch (kind) {
+  case IdentifierColumnKind::String:
+    return "string";
+  case IdentifierColumnKind::Int32:
+    return "int32";
+  }
+  return "unknown";
+}
+
+double compression_ratio_percent(uint64_t compressed_size, uint64_t raw_size) {
+  if (raw_size == 0) {
+    return 0.0;
+  }
+  return 100.0 * static_cast<double>(compressed_size) /
+         static_cast<double>(raw_size);
+}
+
+uint64_t line_content_length(const std::vector<uint64_t> &line_offsets,
+                             uint64_t line_idx) {
+  return line_offsets[line_idx + 1] - line_offsets[line_idx] - 1;
+}
+
+bool is_identifier_separator(uint8_t ch) {
+  return ch == ':' || ch == '/' || ch == '-' || ch == '.' ||
+         std::isspace(static_cast<unsigned char>(ch)) != 0;
+}
+
+TokenizedIdentifier tokenize_identifier(const uint8_t *data, size_t size) {
+  TokenizedIdentifier out;
+  std::string token;
+  std::string separator;
+  bool in_separator = false;
+
+  for (size_t i = 0; i < size; ++i) {
+    const char ch = static_cast<char>(data[i]);
+    if (is_identifier_separator(data[i])) {
+      if (!token.empty()) {
+        out.tokens.push_back(std::move(token));
+        token.clear();
+      }
+      separator.push_back(ch);
+      in_separator = true;
+      continue;
+    }
+
+    if (in_separator) {
+      out.separators.push_back(std::move(separator));
+      separator.clear();
+      in_separator = false;
+    }
+    token.push_back(ch);
+  }
+
+  if (!token.empty()) {
+    out.tokens.push_back(std::move(token));
+  }
+  if (!separator.empty()) {
+    out.separators.push_back(std::move(separator));
+  }
+
+  return out;
+}
+
+bool token_is_int32(const std::string &token) {
+  if (token.empty()) {
+    return false;
+  }
+
+  size_t index = 0;
+  if (token[0] == '+' || token[0] == '-') {
+    if (token.size() == 1) {
+      return false;
+    }
+    index = 1;
+  }
+  for (; index < token.size(); ++index) {
+    if (!std::isdigit(static_cast<unsigned char>(token[index]))) {
+      return false;
+    }
+  }
+  try {
+    const long long value = std::stoll(token);
+    return value >= std::numeric_limits<int32_t>::min() &&
+           value <= std::numeric_limits<int32_t>::max() &&
+           std::to_string(value) == token;
+  } catch (...) {
+    return false;
+  }
+}
+
+int32_t parse_int32_token(const std::string &token) {
+  const long long value = std::stoll(token);
+  if (value < std::numeric_limits<int32_t>::min() ||
+      value > std::numeric_limits<int32_t>::max() ||
+      std::to_string(value) != token) {
+    throw std::runtime_error("Identifier token is not a canonical int32: " +
+                             token);
+  }
+  return static_cast<int32_t>(value);
+}
+
 template <typename T> void cuda_free_if_set(T *ptr) {
   if (ptr != nullptr) {
     cudaFree(ptr);
   }
+}
+
+ChunkedCompressedBuffer host_compress_chunked(const std::vector<uint8_t> &input,
+                                              size_t field_slice_size,
+                                              size_t nvcomp_chunk_size) {
+  ChunkedCompressedBuffer result;
+  if (input.empty()) {
+    return result;
+  }
+  if (field_slice_size == 0 || field_slice_size > MAX_FIELD_SLICE_SIZE) {
+    throw std::runtime_error(
+        "Requested field slice size is out of supported range");
+  }
+
+  for (size_t offset = 0; offset < input.size(); offset += field_slice_size) {
+    const size_t slice_size = std::min(field_slice_size, input.size() - offset);
+    std::vector<uint8_t> slice(
+        input.begin() + static_cast<std::ptrdiff_t>(offset),
+        input.begin() + static_cast<std::ptrdiff_t>(offset + slice_size));
+    auto compressed = nvcomp_zstd_compress(slice, nvcomp_chunk_size);
+    result.chunk_sizes.push_back(compressed.payload.size());
+    result.data.insert(result.data.end(), compressed.payload.begin(),
+                       compressed.payload.end());
+  }
+
+  return result;
+}
+
+std::vector<uint8_t> extract_flat_identifiers_host(const FastqData &data) {
+  const FastqFieldStats stats = compute_field_stats(data);
+  std::vector<uint8_t> identifiers(static_cast<size_t>(stats.identifiers_size));
+
+  uint64_t offset = 0;
+  for (uint64_t record = 0; record < data.num_records; ++record) {
+    const uint64_t id_line = 4 * record;
+    const uint64_t id_len = line_content_length(data.line_offsets, id_line) - 1;
+    const uint64_t id_start = data.line_offsets[id_line] + 1;
+    std::memcpy(identifiers.data() + offset, data.raw_bytes.data() + id_start,
+                static_cast<size_t>(id_len));
+    offset += id_len;
+  }
+
+  return identifiers;
+}
+
+CompressedIdentifierData compress_identifiers_flat(const FastqData &data,
+                                                   size_t field_slice_size,
+                                                   size_t nvcomp_chunk_size) {
+  CompressedIdentifierData result;
+  result.mode = IdentifierCompressionMode::Flat;
+  result.original_size = compute_field_stats(data).identifiers_size;
+  result.flat_data.original_size = result.original_size;
+  auto identifiers = extract_flat_identifiers_host(data);
+  auto chunks =
+      host_compress_chunked(identifiers, field_slice_size, nvcomp_chunk_size);
+  result.flat_data.payload = std::move(chunks.data);
+  result.compressed_flat_chunk_sizes = std::move(chunks.chunk_sizes);
+  return result;
+}
+
+CompressedIdentifierData compress_identifiers_columnar(
+    const FastqData &data, size_t field_slice_size, size_t nvcomp_chunk_size) {
+  if (!data.identifier_layout.columnar ||
+      data.identifier_layout.column_kinds.empty()) {
+    return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
+  }
+
+  std::vector<IdentifierColumnBuffers> columns(
+      data.identifier_layout.column_kinds.size());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    columns[i].kind = data.identifier_layout.column_kinds[i];
+    if (columns[i].kind == IdentifierColumnKind::String) {
+      columns[i].string_lengths.reserve(static_cast<size_t>(data.num_records));
+    } else {
+      columns[i].int_values.reserve(static_cast<size_t>(data.num_records));
+    }
+  }
+
+  for (uint64_t record = 0; record < data.num_records; ++record) {
+    const uint64_t id_line = 4 * record;
+    const uint64_t id_len = line_content_length(data.line_offsets, id_line);
+    const uint64_t id_start = data.line_offsets[id_line] + 1;
+    auto tokenized = tokenize_identifier(data.raw_bytes.data() + id_start,
+                                         static_cast<size_t>(id_len - 1));
+    if (tokenized.tokens.size() != data.identifier_layout.column_kinds.size() ||
+        tokenized.separators != data.identifier_layout.separators) {
+      return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
+    }
+
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (columns[i].kind == IdentifierColumnKind::String) {
+        const auto &token = tokenized.tokens[i];
+        if (token.size() > std::numeric_limits<uint32_t>::max()) {
+          throw std::runtime_error("Identifier token length exceeds uint32_t");
+        }
+        columns[i].string_lengths.push_back(static_cast<uint32_t>(token.size()));
+        columns[i].string_values.insert(columns[i].string_values.end(),
+                                        token.begin(), token.end());
+      } else {
+        if (!token_is_int32(tokenized.tokens[i])) {
+          return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
+        }
+        columns[i].int_values.push_back(parse_int32_token(tokenized.tokens[i]));
+      }
+    }
+  }
+
+  CompressedIdentifierData result;
+  result.mode = IdentifierCompressionMode::Columnar;
+  result.original_size = compute_field_stats(data).identifiers_size;
+  result.layout = data.identifier_layout;
+  result.layout.columnar = true;
+  result.columns.resize(columns.size());
+
+  for (size_t i = 0; i < columns.size(); ++i) {
+    auto &out = result.columns[i];
+    out.kind = columns[i].kind;
+    if (out.kind == IdentifierColumnKind::String) {
+      out.values.original_size = columns[i].string_values.size();
+      auto value_chunks = host_compress_chunked(columns[i].string_values,
+                                                field_slice_size,
+                                                nvcomp_chunk_size);
+      out.values.payload = std::move(value_chunks.data);
+      out.compressed_value_chunk_sizes = std::move(value_chunks.chunk_sizes);
+
+      std::vector<uint8_t> length_bytes(columns[i].string_lengths.size() *
+                                        sizeof(uint32_t));
+      if (!columns[i].string_lengths.empty()) {
+        std::memcpy(length_bytes.data(), columns[i].string_lengths.data(),
+                    length_bytes.size());
+      }
+      out.lengths.original_size = length_bytes.size();
+      auto length_chunks =
+          host_compress_chunked(length_bytes, field_slice_size, nvcomp_chunk_size);
+      out.lengths.payload = std::move(length_chunks.data);
+      out.compressed_length_chunk_sizes = std::move(length_chunks.chunk_sizes);
+    } else {
+      std::vector<uint8_t> value_bytes(columns[i].int_values.size() *
+                                       sizeof(int32_t));
+      if (!columns[i].int_values.empty()) {
+        std::memcpy(value_bytes.data(), columns[i].int_values.data(),
+                    value_bytes.size());
+      }
+      out.values.original_size = value_bytes.size();
+      auto value_chunks =
+          host_compress_chunked(value_bytes, field_slice_size, nvcomp_chunk_size);
+      out.values.payload = std::move(value_chunks.data);
+      out.compressed_value_chunk_sizes = std::move(value_chunks.chunk_sizes);
+    }
+  }
+
+  return result;
+}
+
+std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data,
+                                            uint64_t num_records) {
+  if (data.mode == IdentifierCompressionMode::Flat) {
+    return gpu_decompress_chunked(data.flat_data.payload,
+                                  data.compressed_flat_chunk_sizes,
+                                  data.flat_data.original_size);
+  }
+  if (data.mode != IdentifierCompressionMode::Columnar) {
+    throw std::runtime_error("Unknown identifier compression mode");
+  }
+  if (data.layout.column_kinds.empty() || data.columns.empty() ||
+      data.layout.column_kinds.size() != data.columns.size() ||
+      data.layout.separators.size() + 1 != data.columns.size()) {
+    throw std::runtime_error("Decoded identifier column metadata is invalid");
+  }
+
+  struct DecodedColumn {
+    IdentifierColumnKind kind = IdentifierColumnKind::String;
+    std::vector<uint8_t> value_bytes;
+    std::vector<uint32_t> lengths;
+    const int32_t *int_values = nullptr;
+    size_t value_offset = 0;
+    size_t record_count = 0;
+  };
+
+  std::vector<DecodedColumn> columns(data.columns.size());
+  for (size_t i = 0; i < data.columns.size(); ++i) {
+    columns[i].kind = data.columns[i].kind;
+    columns[i].value_bytes = gpu_decompress_chunked(
+        data.columns[i].values.payload, data.columns[i].compressed_value_chunk_sizes,
+        data.columns[i].values.original_size);
+    if (columns[i].kind == IdentifierColumnKind::String) {
+      const auto length_bytes = gpu_decompress_chunked(
+          data.columns[i].lengths.payload,
+          data.columns[i].compressed_length_chunk_sizes,
+          data.columns[i].lengths.original_size);
+      if (length_bytes.size() != num_records * sizeof(uint32_t)) {
+        throw std::runtime_error(
+            "Decoded identifier string-length payload has an unexpected size");
+      }
+      columns[i].lengths.resize(static_cast<size_t>(num_records));
+      if (!columns[i].lengths.empty()) {
+        std::memcpy(columns[i].lengths.data(), length_bytes.data(),
+                    length_bytes.size());
+      }
+    } else {
+      if (columns[i].value_bytes.size() != num_records * sizeof(int32_t)) {
+        throw std::runtime_error(
+            "Decoded identifier numeric payload has an unexpected size");
+      }
+      columns[i].int_values =
+          reinterpret_cast<const int32_t *>(columns[i].value_bytes.data());
+    }
+  }
+
+  std::vector<uint8_t> identifiers;
+  identifiers.reserve(static_cast<size_t>(data.original_size));
+  for (uint64_t record = 0; record < num_records; ++record) {
+    for (size_t column = 0; column < columns.size(); ++column) {
+      if (columns[column].kind == IdentifierColumnKind::String) {
+        const uint32_t len = columns[column].lengths[static_cast<size_t>(record)];
+        if (columns[column].value_offset + len > columns[column].value_bytes.size()) {
+          throw std::runtime_error(
+              "Decoded identifier string column exceeds its payload");
+        }
+        identifiers.insert(
+            identifiers.end(),
+            columns[column].value_bytes.begin() +
+                static_cast<std::ptrdiff_t>(columns[column].value_offset),
+            columns[column].value_bytes.begin() +
+                static_cast<std::ptrdiff_t>(columns[column].value_offset + len));
+        columns[column].value_offset += len;
+      } else {
+        const auto token = std::to_string(columns[column].int_values[record]);
+        identifiers.insert(identifiers.end(), token.begin(), token.end());
+      }
+
+      if (column + 1 < data.layout.separators.size() + 1) {
+        const auto &sep = data.layout.separators[column];
+        identifiers.insert(identifiers.end(), sep.begin(), sep.end());
+      }
+    }
+  }
+
+  if (identifiers.size() != data.original_size) {
+    throw std::runtime_error(
+        "Decoded identifier columns reconstructed an unexpected size");
+  }
+  return identifiers;
 }
 
 __global__ void compute_field_lengths_kernel(const uint64_t *line_offsets,
@@ -106,8 +469,10 @@ __global__ void gather_fields_kernel(
   const uint64_t seq_dst = basecall_offsets[idx];
   const uint64_t qual_dst = quality_offsets[idx];
 
-  for (uint64_t i = 0; i < identifier_lengths[idx]; ++i) {
-    identifiers[id_dst + i] = raw_bytes[id_src + i];
+  if (identifiers != nullptr) {
+    for (uint64_t i = 0; i < identifier_lengths[idx]; ++i) {
+      identifiers[id_dst + i] = raw_bytes[id_src + i];
+    }
   }
   for (uint64_t i = 0; i < basecall_lengths[idx]; ++i) {
     basecalls[seq_dst + i] = raw_bytes[seq_src + i];
@@ -656,6 +1021,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   result.quality_scores.original_size = stats.quality_scores_size;
   result.line_lengths.original_size = stats.line_length_size;
   result.line_offset_count = data.line_offsets.size();
+  const bool use_columnar_identifiers = data.identifier_layout.columnar;
 
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
@@ -726,7 +1092,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                  data.num_records,
                              thrust::device_pointer_cast(d_quality_offsets));
 
-      if (stats.identifiers_size > 0) {
+      if (!use_columnar_identifiers && stats.identifiers_size > 0) {
         CUDA_CHECK(cudaMalloc(&fields.identifiers, stats.identifiers_size));
       }
       if (stats.basecalls_size > 0) {
@@ -756,13 +1122,59 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
 
     std::cerr << "Compressing identifiers (" << stats.identifiers_size
               << " bytes)..." << std::endl;
-    auto id_chunks =
-        gpu_compress_device_chunked(fields.identifiers, stats.identifiers_size,
-                                    field_slice_size, chunk_size, stream);
-    result.identifiers.payload = std::move(id_chunks.data);
-    result.compressed_identifier_chunk_sizes = std::move(id_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.identifiers.payload.size() << " bytes"
-              << std::endl;
+    if (use_columnar_identifiers) {
+      result.identifiers = compress_identifiers_columnar(data, field_slice_size,
+                                                         chunk_size);
+      uint64_t compressed_identifier_size = result.identifiers.flat_data.payload.size();
+      for (const auto &column : result.identifiers.columns) {
+        compressed_identifier_size += column.values.payload.size();
+        compressed_identifier_size += column.lengths.payload.size();
+      }
+      std::cerr << "  Mode: "
+                << (result.identifiers.mode == IdentifierCompressionMode::Columnar
+                        ? "columnar"
+                        : "flat")
+                << std::endl;
+      if (result.identifiers.mode == IdentifierCompressionMode::Columnar) {
+        std::cerr << "  Columns: " << result.identifiers.columns.size()
+                  << std::endl;
+        for (size_t i = 0; i < result.identifiers.columns.size(); ++i) {
+          const auto &column = result.identifiers.columns[i];
+          const uint64_t raw_value_size = column.values.original_size;
+          const uint64_t comp_value_size = column.values.payload.size();
+          const uint64_t raw_length_size = column.lengths.original_size;
+          const uint64_t comp_length_size = column.lengths.payload.size();
+          const uint64_t raw_total = raw_value_size + raw_length_size;
+          const uint64_t comp_total = comp_value_size + comp_length_size;
+          std::cerr << "    [" << i << "] "
+                    << identifier_column_kind_name(column.kind)
+                    << " values " << raw_value_size << " -> "
+                    << comp_value_size << " B";
+          if (column.kind == IdentifierColumnKind::String) {
+            std::cerr << ", lengths " << raw_length_size << " -> "
+                      << comp_length_size << " B";
+          }
+          std::cerr << ", total " << raw_total << " -> " << comp_total
+                    << " B ("
+                    << compression_ratio_percent(comp_total, raw_total) << " %)"
+                    << std::endl;
+        }
+      }
+      std::cerr << "  -> " << compressed_identifier_size << " bytes"
+                << std::endl;
+    } else {
+      auto id_chunks =
+          gpu_compress_device_chunked(fields.identifiers, stats.identifiers_size,
+                                      field_slice_size, chunk_size, stream);
+      result.identifiers.mode = IdentifierCompressionMode::Flat;
+      result.identifiers.flat_data.original_size = stats.identifiers_size;
+      result.identifiers.flat_data.payload = std::move(id_chunks.data);
+      result.identifiers.compressed_flat_chunk_sizes =
+          std::move(id_chunks.chunk_sizes);
+      std::cerr << "  Mode: flat" << std::endl;
+      std::cerr << "  -> " << result.identifiers.flat_data.payload.size()
+                << " bytes" << std::endl;
+    }
 
     std::cerr << "Compressing basecalls (" << stats.basecalls_size
               << " bytes)..." << std::endl;
@@ -871,9 +1283,7 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
                            const BscConfig &bsc_config) {
   std::cerr << "Decompressing identifiers..." << std::endl;
   const auto identifiers =
-      gpu_decompress_chunked(compressed.identifiers.payload,
-                             compressed.compressed_identifier_chunk_sizes,
-                             compressed.identifiers.original_size);
+      decompress_identifiers(compressed.identifiers, compressed.num_records);
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;

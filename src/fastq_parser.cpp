@@ -1,5 +1,6 @@
 #include "gpufastq/fastq_parser.hpp"
 
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -8,6 +9,142 @@
 namespace gpufastq {
 
 namespace {
+
+constexpr uint64_t IDENTIFIER_DISCOVERY_RECORDS = 100;
+
+bool is_identifier_separator(uint8_t ch) {
+  return ch == ':' || ch == '/' || ch == '-' || ch == '.' ||
+         std::isspace(static_cast<unsigned char>(ch)) != 0;
+}
+
+struct TokenizedIdentifier {
+  std::vector<std::string> tokens;
+  std::vector<std::string> separators;
+};
+
+uint64_t line_content_length(const std::vector<uint64_t> &line_offsets,
+                             uint64_t line_idx);
+
+TokenizedIdentifier tokenize_identifier(const uint8_t *data, size_t size) {
+  TokenizedIdentifier out;
+  std::string token;
+  std::string separator;
+  bool in_separator = false;
+
+  for (size_t i = 0; i < size; ++i) {
+    const char ch = static_cast<char>(data[i]);
+    if (is_identifier_separator(data[i])) {
+      if (!token.empty()) {
+        out.tokens.push_back(std::move(token));
+        token.clear();
+      }
+      separator.push_back(ch);
+      in_separator = true;
+      continue;
+    }
+
+    if (in_separator) {
+      out.separators.push_back(std::move(separator));
+      separator.clear();
+      in_separator = false;
+    }
+    token.push_back(ch);
+  }
+
+  if (!token.empty()) {
+    out.tokens.push_back(std::move(token));
+  }
+  if (!separator.empty()) {
+    out.separators.push_back(std::move(separator));
+  }
+
+  return out;
+}
+
+bool token_is_int32(const std::string &token) {
+  if (token.empty()) {
+    return false;
+  }
+
+  size_t index = 0;
+  if (token[0] == '+' || token[0] == '-') {
+    if (token.size() == 1) {
+      return false;
+    }
+    index = 1;
+  }
+
+  for (; index < token.size(); ++index) {
+    if (!std::isdigit(static_cast<unsigned char>(token[index]))) {
+      return false;
+    }
+  }
+
+  try {
+    const long long value = std::stoll(token);
+    if (std::to_string(value) != token) {
+      return false;
+    }
+    return value >= std::numeric_limits<int32_t>::min() &&
+           value <= std::numeric_limits<int32_t>::max();
+  } catch (...) {
+    return false;
+  }
+}
+
+IdentifierLayout discover_identifier_layout(const FastqData &data) {
+  IdentifierLayout layout;
+  const uint64_t sample_records =
+      std::min<uint64_t>(IDENTIFIER_DISCOVERY_RECORDS, data.num_records);
+  if (sample_records == 0) {
+    return layout;
+  }
+
+  const uint64_t first_len = line_content_length(data.line_offsets, 0);
+  if (first_len <= 1) {
+    return layout;
+  }
+
+  const uint64_t first_start = data.line_offsets[0] + 1;
+  auto reference =
+      tokenize_identifier(data.raw_bytes.data() + first_start, first_len - 1);
+  if (reference.tokens.empty() || reference.separators.size() + 1 != reference.tokens.size()) {
+    return layout;
+  }
+
+  std::vector<bool> numeric(reference.tokens.size(), true);
+  for (size_t i = 0; i < reference.tokens.size(); ++i) {
+    numeric[i] = token_is_int32(reference.tokens[i]);
+  }
+
+  for (uint64_t record = 1; record < sample_records; ++record) {
+    const uint64_t id_line = 4 * record;
+    const uint64_t id_len = line_content_length(data.line_offsets, id_line);
+    if (id_len <= 1) {
+      return {};
+    }
+
+    const uint64_t id_start = data.line_offsets[id_line] + 1;
+    auto tokenized =
+        tokenize_identifier(data.raw_bytes.data() + id_start, id_len - 1);
+    if (tokenized.tokens.size() != reference.tokens.size() ||
+        tokenized.separators != reference.separators) {
+      return {};
+    }
+    for (size_t i = 0; i < tokenized.tokens.size(); ++i) {
+      numeric[i] = numeric[i] && token_is_int32(tokenized.tokens[i]);
+    }
+  }
+
+  layout.columnar = true;
+  layout.separators = std::move(reference.separators);
+  layout.column_kinds.reserve(reference.tokens.size());
+  for (bool is_numeric : numeric) {
+    layout.column_kinds.push_back(is_numeric ? IdentifierColumnKind::Int32
+                                            : IdentifierColumnKind::String);
+  }
+  return layout;
+}
 
 uint64_t line_content_length(const std::vector<uint64_t> &line_offsets,
                              uint64_t line_idx) {
@@ -136,6 +273,7 @@ FastqData parse_fastq(const std::string &filepath) {
   data.num_records = (data.line_offsets.size() - 1) / 4;
 
   validate_fastq_layout(data);
+  data.identifier_layout = discover_identifier_layout(data);
   return data;
 }
 
