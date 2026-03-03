@@ -6,74 +6,154 @@
 
 namespace gpufastq {
 
+namespace {
+
+uint64_t line_content_length(const std::vector<uint64_t> &line_offsets,
+                             uint64_t line_idx) {
+  const uint64_t line_start = line_offsets[line_idx];
+  const uint64_t next_line_start = line_offsets[line_idx + 1];
+  if (next_line_start <= line_start) {
+    throw std::runtime_error("FASTQ line offsets are not strictly increasing");
+  }
+  return next_line_start - line_start - 1;
+}
+
+void validate_fastq_layout(const FastqData &data) {
+  if (data.raw_bytes.empty()) {
+    if (data.line_offsets.size() != 1 || data.line_offsets[0] != 0 ||
+        data.num_records != 0) {
+      throw std::runtime_error("Empty FASTQ metadata is inconsistent");
+    }
+    return;
+  }
+
+  if (data.raw_bytes.back() != '\n') {
+    throw std::runtime_error("FASTQ file must end with a newline");
+  }
+  if (data.line_offsets.empty() || data.line_offsets.front() != 0) {
+    throw std::runtime_error("FASTQ line index must start at byte offset 0");
+  }
+  if (data.line_offsets.back() != data.raw_bytes.size()) {
+    throw std::runtime_error("FASTQ line index sentinel is inconsistent with the file size");
+  }
+
+  const uint64_t num_lines = data.line_offsets.size() - 1;
+  if (num_lines % 4 != 0) {
+    throw std::runtime_error("FASTQ file does not contain a multiple of 4 lines");
+  }
+  if (data.num_records != num_lines / 4) {
+    throw std::runtime_error("FASTQ record count does not match the line index");
+  }
+
+  for (uint64_t record = 0; record < data.num_records; ++record) {
+    const uint64_t id_line = 4 * record;
+    const uint64_t seq_line = id_line + 1;
+    const uint64_t plus_line = id_line + 2;
+    const uint64_t qual_line = id_line + 3;
+
+    const uint64_t id_start = data.line_offsets[id_line];
+    const uint64_t seq_start = data.line_offsets[seq_line];
+    const uint64_t plus_start = data.line_offsets[plus_line];
+    const uint64_t qual_start = data.line_offsets[qual_line];
+
+    if (data.raw_bytes[id_start] != '@') {
+      throw std::runtime_error("Expected '@' at record " +
+                               std::to_string(record + 1));
+    }
+    if (data.raw_bytes[plus_start] != '+') {
+      throw std::runtime_error("Expected '+' at record " +
+                               std::to_string(record + 1));
+    }
+
+    const uint64_t id_len = line_content_length(data.line_offsets, id_line);
+    const uint64_t seq_len = line_content_length(data.line_offsets, seq_line);
+    const uint64_t plus_len = line_content_length(data.line_offsets, plus_line);
+    const uint64_t qual_len = line_content_length(data.line_offsets, qual_line);
+
+    if (id_len <= 1) {
+      throw std::runtime_error("Identifier line is empty at record " +
+                               std::to_string(record + 1));
+    }
+    if (plus_len != 1) {
+      throw std::runtime_error(
+          "Only '+' separator lines without comments are supported");
+    }
+    if (seq_len != qual_len) {
+      throw std::runtime_error("Sequence/quality length mismatch at record " +
+                               std::to_string(record + 1));
+    }
+    if (seq_start != id_start + id_len + 1) {
+      throw std::runtime_error("Identifier line length does not match line index");
+    }
+    if (plus_start != seq_start + seq_len + 1) {
+      throw std::runtime_error("Sequence line length does not match line index");
+    }
+    if (qual_start != plus_start + plus_len + 1) {
+      throw std::runtime_error("Plus line length does not match line index");
+    }
+  }
+}
+
+} // namespace
+
 FastqData parse_fastq(const std::string &filepath) {
-  std::ifstream file(filepath, std::ios::binary);
+  std::ifstream file(filepath, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
     throw std::runtime_error("Cannot open FASTQ file: " + filepath);
   }
 
+  const auto end_pos = file.tellg();
+  if (end_pos < 0) {
+    throw std::runtime_error("Cannot determine FASTQ file size: " + filepath);
+  }
+
   FastqData data;
-  std::string line;
-  uint64_t line_num = 0;
+  data.raw_bytes.resize(static_cast<size_t>(end_pos));
 
-  while (std::getline(file, line)) {
-    // Handle Windows line endings
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
+  file.seekg(0, std::ios::beg);
+  if (!data.raw_bytes.empty()) {
+    file.read(reinterpret_cast<char *>(data.raw_bytes.data()),
+              static_cast<std::streamsize>(data.raw_bytes.size()));
+    if (!file) {
+      throw std::runtime_error("Failed to read FASTQ file: " + filepath);
     }
-
-    switch (line_num % 4) {
-    case 0: {
-      // Identifier line (starts with @)
-      if (line.empty() || line[0] != '@') {
-        throw std::runtime_error("Expected '@' at line " +
-                                 std::to_string(line_num + 1));
-      }
-      // Store without '@' prefix
-      auto id = line.substr(1);
-      data.identifiers.insert(data.identifiers.end(), id.begin(), id.end());
-      data.identifier_lengths.push_back(id.size());
-      break;
-    }
-    case 1: {
-      // Basecall / sequence line
-      data.basecalls.insert(data.basecalls.end(), line.begin(), line.end());
-      data.basecall_lengths.push_back(line.size());
-      break;
-    }
-    case 2: {
-      // '+' separator — skip
-      if (line.empty() || line[0] != '+') {
-        throw std::runtime_error("Expected '+' at line " +
-                                 std::to_string(line_num + 1));
-      }
-      break;
-    }
-    case 3: {
-      // Quality score line
-      if (data.basecall_lengths.empty()) {
-        throw std::runtime_error("Missing sequence before quality line " +
-                                 std::to_string(line_num + 1));
-      }
-      if (line.size() != data.basecall_lengths.back()) {
-        throw std::runtime_error("Sequence/quality length mismatch at record " +
-                                 std::to_string(data.num_records + 1));
-      }
-      data.quality_scores.insert(data.quality_scores.end(), line.begin(),
-                                 line.end());
-      data.quality_lengths.push_back(line.size());
-      data.num_records++;
-      break;
-    }
-    }
-    line_num++;
   }
 
-  if (line_num % 4 != 0) {
-    throw std::runtime_error("Incomplete FASTQ record at end of file");
+  if (data.raw_bytes.empty()) {
+    data.line_offsets = {0};
+    return data;
   }
 
+  data.line_offsets.reserve(data.raw_bytes.size() / 40 + 2);
+  data.line_offsets.push_back(0);
+  for (uint64_t i = 0; i < data.raw_bytes.size(); ++i) {
+    if (data.raw_bytes[i] == '\n' && (i + 1) < data.raw_bytes.size()) {
+      data.line_offsets.push_back(i + 1);
+    }
+  }
+  data.line_offsets.push_back(data.raw_bytes.size());
+  data.num_records = (data.line_offsets.size() - 1) / 4;
+
+  validate_fastq_layout(data);
   return data;
+}
+
+FastqFieldStats compute_field_stats(const FastqData &data) {
+  validate_fastq_layout(data);
+
+  FastqFieldStats stats;
+  stats.line_index_size = data.line_offsets.size() * sizeof(uint64_t);
+  for (uint64_t record = 0; record < data.num_records; ++record) {
+    const uint64_t id_line = 4 * record;
+    const uint64_t seq_line = id_line + 1;
+    const uint64_t qual_line = id_line + 3;
+
+    stats.identifiers_size += line_content_length(data.line_offsets, id_line) - 1;
+    stats.basecalls_size += line_content_length(data.line_offsets, seq_line);
+    stats.quality_scores_size += line_content_length(data.line_offsets, qual_line);
+  }
+
+  return stats;
 }
 
 void write_fastq(const std::string &filepath, const FastqData &data) {
@@ -82,53 +162,12 @@ void write_fastq(const std::string &filepath, const FastqData &data) {
     throw std::runtime_error("Cannot open output file: " + filepath);
   }
 
-  if (data.identifier_lengths.size() != data.num_records ||
-      data.basecall_lengths.size() != data.num_records ||
-      data.quality_lengths.size() != data.num_records) {
-    throw std::runtime_error(
-        "Record count mismatch during FASTQ reconstruction");
-  }
-
-  uint64_t id_offset = 0;
-  uint64_t seq_offset = 0;
-  uint64_t qual_offset = 0;
-
-  for (uint64_t i = 0; i < data.num_records; i++) {
-    const auto id_len = data.identifier_lengths[i];
-    const auto seq_len = data.basecall_lengths[i];
-    const auto qual_len = data.quality_lengths[i];
-
-    if (qual_len != seq_len) {
-      throw std::runtime_error("Sequence/quality length mismatch during FASTQ reconstruction");
+  if (!data.raw_bytes.empty()) {
+    file.write(reinterpret_cast<const char *>(data.raw_bytes.data()),
+               static_cast<std::streamsize>(data.raw_bytes.size()));
+    if (!file) {
+      throw std::runtime_error("Failed to write FASTQ file: " + filepath);
     }
-    if (id_offset + id_len > data.identifiers.size() ||
-        seq_offset + seq_len > data.basecalls.size() ||
-        qual_offset + qual_len > data.quality_scores.size()) {
-      throw std::runtime_error("Index exceeds FASTQ field buffer size");
-    }
-
-    file << '@';
-    file.write(reinterpret_cast<const char *>(data.identifiers.data() + id_offset),
-               static_cast<std::streamsize>(id_len));
-    file << '\n';
-    file.write(reinterpret_cast<const char *>(data.basecalls.data() + seq_offset),
-               static_cast<std::streamsize>(seq_len));
-    file << '\n'
-         << '+'
-         << '\n';
-    file.write(reinterpret_cast<const char *>(data.quality_scores.data() + qual_offset),
-               static_cast<std::streamsize>(qual_len));
-    file << '\n';
-
-    id_offset += id_len;
-    seq_offset += seq_len;
-    qual_offset += qual_len;
-  }
-
-  if (id_offset != data.identifiers.size() ||
-      seq_offset != data.basecalls.size() ||
-      qual_offset != data.quality_scores.size()) {
-    throw std::runtime_error("FASTQ field buffer contains trailing data outside the index");
   }
 }
 

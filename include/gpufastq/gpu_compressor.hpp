@@ -16,11 +16,11 @@ std::vector<uint8_t> gpu_compress(const std::vector<uint8_t> &input,
 /// Decompress a single buffer using GPU-accelerated zstd (nvcomp)
 std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed);
 
-/// Compress all three FASTQ fields on GPU
+/// Extract identifiers/basecalls/quality plus the line index and compress them.
 CompressedFastqData compress_fastq(const FastqData &data,
                                    size_t chunk_size = DEFAULT_CHUNK_SIZE);
 
-/// Decompress all three FASTQ fields on GPU
+/// Decompress field streams and rebuild the raw FASTQ byte buffer.
 FastqData decompress_fastq(const CompressedFastqData &compressed);
 
 } // namespace gpufastq

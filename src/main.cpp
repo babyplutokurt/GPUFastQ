@@ -26,15 +26,19 @@ int do_compress(const std::string &in, const std::string &out) {
 
   std::cerr << "=== Parsing FASTQ: " << in << " ===\n";
   auto data = gpufastq::parse_fastq(in);
+  auto stats = gpufastq::compute_field_stats(data);
   auto t1 = clk::now();
 
   std::cerr << "Parsed " << data.num_records << " records\n"
-            << "  Identifiers:    " << data.identifiers.size() << " B\n"
-            << "  Basecalls:      " << data.basecalls.size() << " B\n"
-            << "  Quality scores: " << data.quality_scores.size() << " B\n";
+            << "  FASTQ bytes:     " << data.raw_bytes.size() << " B\n"
+            << "  Line offsets:    " << data.line_offsets.size() << "\n"
+            << "  Identifiers:     " << stats.identifiers_size << " B\n"
+            << "  Basecalls:       " << stats.basecalls_size << " B\n"
+            << "  Quality scores:  " << stats.quality_scores_size << " B\n"
+            << "  Index bytes:     " << stats.line_index_size << " B\n";
 
-  size_t raw = data.identifiers.size() + data.basecalls.size() +
-               data.quality_scores.size();
+  size_t raw = stats.identifiers_size + stats.basecalls_size +
+               stats.quality_scores_size + stats.line_index_size;
 
   std::cerr << "\n=== GPU Compression ===\n";
   auto comp = gpufastq::compress_fastq(data);
@@ -42,7 +46,8 @@ int do_compress(const std::string &in, const std::string &out) {
 
   size_t cmp = comp.compressed_identifiers.size() +
                comp.compressed_basecalls.size() +
-               comp.compressed_quality.size();
+               comp.compressed_quality.size() +
+               comp.compressed_line_offsets.size();
 
   std::cerr << "\n=== Serializing: " << out << " ===\n";
   gpufastq::serialize(out, comp);
@@ -122,28 +127,12 @@ int do_roundtrip(const std::string &input_path) {
     std::cerr << "FAIL: record count\n";
     ok = false;
   }
-  if (original.identifiers != decoded.identifiers) {
-    std::cerr << "FAIL: identifiers\n";
+  if (original.raw_bytes != decoded.raw_bytes) {
+    std::cerr << "FAIL: raw FASTQ bytes\n";
     ok = false;
   }
-  if (original.identifier_lengths != decoded.identifier_lengths) {
-    std::cerr << "FAIL: identifier index\n";
-    ok = false;
-  }
-  if (original.basecalls != decoded.basecalls) {
-    std::cerr << "FAIL: basecalls\n";
-    ok = false;
-  }
-  if (original.basecall_lengths != decoded.basecall_lengths) {
-    std::cerr << "FAIL: basecall index\n";
-    ok = false;
-  }
-  if (original.quality_scores != decoded.quality_scores) {
-    std::cerr << "FAIL: quality scores\n";
-    ok = false;
-  }
-  if (original.quality_lengths != decoded.quality_lengths) {
-    std::cerr << "FAIL: quality index\n";
+  if (original.line_offsets != decoded.line_offsets) {
+    std::cerr << "FAIL: line offsets\n";
     ok = false;
   }
 

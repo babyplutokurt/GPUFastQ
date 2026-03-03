@@ -5,11 +5,13 @@
 
 namespace gpufastq {
 
-/// Parse a FASTQ file, splitting records into identifier/basecall/quality
-/// vectors
+/// Parse a FASTQ file into a raw byte buffer and a line-start index.
 FastqData parse_fastq(const std::string &filepath);
 
-/// Reconstruct a FASTQ file from separated field vectors
+/// Summarize the byte size of the extracted FASTQ field streams and index.
+FastqFieldStats compute_field_stats(const FastqData &data);
+
+/// Write a FASTQ file from its raw byte representation.
 void write_fastq(const std::string &filepath, const FastqData &data);
 
 } // namespace gpufastq
