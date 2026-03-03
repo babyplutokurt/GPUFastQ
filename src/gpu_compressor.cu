@@ -396,14 +396,22 @@ CompressedBasecallData compress_basecalls_device(const uint8_t *d_basecalls,
     }
 
     uint64_t total_n_count = 0;
-    result.n_counts.resize(block_count);
+    std::vector<uint16_t> h_n_counts_16(block_count);
     for (uint64_t i = 0; i < block_count; ++i) {
       if (h_n_counts[i] > BASECALL_N_BLOCK_SIZE) {
         throw std::runtime_error("Basecall N-count overflowed its block size");
       }
-      result.n_counts[i] = static_cast<uint16_t>(h_n_counts[i]);
+      h_n_counts_16[i] = static_cast<uint16_t>(h_n_counts[i]);
       total_n_count += h_n_counts[i];
     }
+
+    std::vector<uint8_t> h_n_count_bytes(block_count * sizeof(uint16_t));
+    if (!h_n_counts_16.empty()) {
+      std::memcpy(h_n_count_bytes.data(), h_n_counts_16.data(),
+                  h_n_count_bytes.size());
+    }
+    result.n_counts =
+        nvcomp_zstd_compress(h_n_count_bytes, nvcomp_chunk_size, stream);
 
     if (total_n_count > 0) {
       result.n_positions.original_size = total_n_count * sizeof(uint16_t);
@@ -457,6 +465,7 @@ CompressedBasecallData compress_basecalls_device(const uint8_t *d_basecalls,
 
 std::vector<uint8_t>
 decode_basecalls(const CompressedBasecallData &compressed,
+                 const std::vector<uint8_t> &n_count_bytes,
                  const std::vector<uint8_t> &packed_bases,
                  const std::vector<uint8_t> &n_position_bytes) {
   if (compressed.original_size == 0) {
@@ -470,9 +479,10 @@ decode_basecalls(const CompressedBasecallData &compressed,
   const uint64_t expected_block_count =
       (compressed.original_size + compressed.n_block_size - 1) /
       compressed.n_block_size;
-  if (compressed.n_counts.size() != expected_block_count) {
+  if (n_count_bytes.size() != expected_block_count * sizeof(uint16_t)) {
     throw std::runtime_error("Decoded basecall N-count metadata is invalid");
   }
+  const auto *n_counts = reinterpret_cast<const uint16_t *>(n_count_bytes.data());
 
   const size_t expected_packed_size =
       static_cast<size_t>((compressed.original_size + 3) / 4);
@@ -481,8 +491,8 @@ decode_basecalls(const CompressedBasecallData &compressed,
   }
 
   uint64_t total_n_count = 0;
-  for (uint16_t count : compressed.n_counts) {
-    total_n_count += count;
+  for (uint64_t i = 0; i < expected_block_count; ++i) {
+    total_n_count += n_counts[i];
   }
   if (n_position_bytes.size() != total_n_count * sizeof(uint16_t)) {
     throw std::runtime_error("Decoded N-position payload has an unexpected size");
@@ -499,13 +509,12 @@ decode_basecalls(const CompressedBasecallData &compressed,
   const auto *n_positions =
       reinterpret_cast<const uint16_t *>(n_position_bytes.data());
   uint64_t n_offset = 0;
-  for (uint64_t block_index = 0; block_index < compressed.n_counts.size();
-       ++block_index) {
+  for (uint64_t block_index = 0; block_index < expected_block_count; ++block_index) {
     const uint64_t block_start = block_index * compressed.n_block_size;
     const uint64_t block_end =
         std::min<uint64_t>(block_start + compressed.n_block_size,
                            compressed.original_size);
-    for (uint16_t count = 0; count < compressed.n_counts[block_index]; ++count) {
+    for (uint16_t count = 0; count < n_counts[block_index]; ++count) {
       const uint16_t local_index = n_positions[n_offset++];
       if (block_start + local_index >= block_end) {
         throw std::runtime_error(
@@ -763,11 +772,23 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                                  stream);
     const uint64_t compressed_basecall_size =
         result.basecalls.packed_bases.payload.size() +
+        result.basecalls.n_counts.payload.size() +
         result.basecalls.n_positions.payload.size();
     uint64_t total_n_count = 0;
-    for (uint16_t count : result.basecalls.n_counts) {
-      total_n_count += count;
+    const uint64_t basecall_block_count =
+        result.basecalls.original_size == 0
+            ? 0
+            : (result.basecalls.original_size + result.basecalls.n_block_size - 1) /
+                  result.basecalls.n_block_size;
+    if (result.basecalls.n_counts.original_size !=
+        basecall_block_count * sizeof(uint16_t)) {
+      throw std::runtime_error("Compressed N-count payload has an unexpected size");
     }
+    if (result.basecalls.n_positions.original_size % sizeof(uint16_t) != 0) {
+      throw std::runtime_error(
+          "Compressed N-position payload has an unexpected size");
+    }
+    total_n_count = result.basecalls.n_positions.original_size / sizeof(uint16_t);
     std::cerr << "  Packed bases: " << result.basecalls.packed_bases.original_size
               << " bytes, N positions: " << total_n_count << std::endl;
     std::cerr << "  -> " << compressed_basecall_size << " bytes" << std::endl;
@@ -856,6 +877,7 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;
+  const auto n_count_bytes = nvcomp_zstd_decompress(compressed.basecalls.n_counts);
   const auto packed_bases = gpu_decompress_chunked(
       compressed.basecalls.packed_bases.payload,
       compressed.basecalls.compressed_packed_chunk_sizes,
@@ -864,8 +886,8 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
       compressed.basecalls.n_positions.payload,
       compressed.basecalls.compressed_n_position_chunk_sizes,
       compressed.basecalls.n_positions.original_size);
-  const auto basecalls =
-      decode_basecalls(compressed.basecalls, packed_bases, n_position_bytes);
+  const auto basecalls = decode_basecalls(compressed.basecalls, n_count_bytes,
+                                          packed_bases, n_position_bytes);
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
