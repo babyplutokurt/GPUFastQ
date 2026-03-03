@@ -92,13 +92,23 @@ add_library(gpufastq_lib
     src/serializer.cpp
 )
 
+find_package(OpenMP REQUIRED)
+find_library(BSC_LIBRARY NAMES bsc PATHS /usr/local/lib)
+if (NOT BSC_LIBRARY)
+    message(FATAL_ERROR "bsc library not found")
+endif()
+
 target_include_directories(gpufastq_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    /usr/local/include
 )
 
 target_link_libraries(gpufastq_lib PUBLIC
     nvcomp
     CUDA::cudart
+    ${BSC_LIBRARY}
+    OpenMP::OpenMP_CXX
+    /home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu/libomp.so
 )
 
 set_target_properties(gpufastq_lib PROPERTIES
@@ -111,3 +121,8 @@ set_target_properties(gpufastq_lib PROPERTIES
 # ============================================================
 add_executable(gpufastq src/main.cpp)
 target_link_libraries(gpufastq PRIVATE gpufastq_lib)
+
+set_target_properties(gpufastq PROPERTIES
+    BUILD_RPATH "/home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu;/usr/local/lib"
+    INSTALL_RPATH "/home/linuxbrew/.linuxbrew/Cellar/llvm/21.1.8/lib/x86_64-unknown-linux-gnu;/usr/local/lib"
+)
