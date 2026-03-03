@@ -13,7 +13,7 @@ constexpr const char *COMPRESSED_EXTENSION = ".gpufq";
 constexpr uint32_t MAGIC = 0x5A514647;
 
 /// File format version
-constexpr uint32_t FORMAT_VERSION = 1;
+constexpr uint32_t FORMAT_VERSION = 3;
 
 /// Serialize compressed FASTQ data to a binary .gpufq file
 void serialize(const std::string &filepath, const CompressedFastqData &data);

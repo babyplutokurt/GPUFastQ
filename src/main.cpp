@@ -126,12 +126,24 @@ int do_roundtrip(const std::string &input_path) {
     std::cerr << "FAIL: identifiers\n";
     ok = false;
   }
+  if (original.identifier_lengths != decoded.identifier_lengths) {
+    std::cerr << "FAIL: identifier index\n";
+    ok = false;
+  }
   if (original.basecalls != decoded.basecalls) {
     std::cerr << "FAIL: basecalls\n";
     ok = false;
   }
+  if (original.basecall_lengths != decoded.basecall_lengths) {
+    std::cerr << "FAIL: basecall index\n";
+    ok = false;
+  }
   if (original.quality_scores != decoded.quality_scores) {
     std::cerr << "FAIL: quality scores\n";
+    ok = false;
+  }
+  if (original.quality_lengths != decoded.quality_lengths) {
+    std::cerr << "FAIL: quality index\n";
     ok = false;
   }
 
