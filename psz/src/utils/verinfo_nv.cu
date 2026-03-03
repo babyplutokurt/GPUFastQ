@@ -100,11 +100,14 @@ void CUDA_devices()
     cudaSetDevice(dev);
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, dev);
+    int memoryClockRateKHz = 0;
+    getCudaAttribute(
+        &memoryClockRateKHz, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, dev);
 
     auto membw_GiBps = membw_base1024(
-        deviceProp.memoryBusWidth, deviceProp.memoryClockRate * 1e3);
+        deviceProp.memoryBusWidth, memoryClockRateKHz * 1e3);
     auto membw_GBps = membw_base1000(
-        deviceProp.memoryBusWidth, deviceProp.memoryClockRate * 1e3);
+        deviceProp.memoryBusWidth, memoryClockRateKHz * 1e3);
 
     printf("- %s\n", deviceProp.name);
     printf(

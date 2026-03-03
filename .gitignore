@@ -2,3 +2,5 @@ data/
 ./data
 build/
 ./build
+.cache/
+./.cache

@@ -31,6 +31,7 @@ add_compile_definitions(PSZ_USE_CUDA)
 add_compile_definitions(_PORTABLE_USE_CUDA)
 
 find_package(CUDAToolkit REQUIRED)
+include_directories(${CUDAToolkit_INCLUDE_DIRS})
 
 include(GNUInstallDirs)
 
@@ -183,7 +184,7 @@ install(FILES
 # 2) Build the "main_index" executable from main_indexing.cpp
 ###############################################################################
 cuda_add_executable(main_index
-        src/main_indexing.cpp
+        src/main_indexing_cuda.cu
         src/indexing.cu
         src/utils/file_utils.cpp
 )
@@ -227,4 +228,3 @@ cuda_add_executable(main_basecall
         src/basecall_compress.cu
 )
 target_link_libraries(main_basecall ${CUDA_LIBRARIES})
-
