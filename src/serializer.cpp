@@ -82,10 +82,10 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
-  validate_chunked_stream(data.line_offsets.payload,
-                          data.line_offsets.original_size,
-                          data.compressed_line_offset_chunk_sizes,
-                          "line-offset");
+  validate_chunked_stream(data.line_lengths.payload,
+                          data.line_lengths.original_size,
+                          data.compressed_line_length_chunk_sizes,
+                          "line-length");
 
   write_val(file, MAGIC);
   write_val(file, FORMAT_VERSION);
@@ -107,20 +107,20 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file,
             static_cast<uint64_t>(data.compressed_quality_chunk_sizes.size()));
 
-  write_val(file, static_cast<uint64_t>(data.line_offsets.original_size));
-  write_val(file, static_cast<uint64_t>(data.line_offsets.payload.size()));
+  write_val(file, static_cast<uint64_t>(data.line_lengths.original_size));
+  write_val(file, static_cast<uint64_t>(data.line_lengths.payload.size()));
   write_val(file,
-            static_cast<uint64_t>(data.compressed_line_offset_chunk_sizes.size()));
+            static_cast<uint64_t>(data.compressed_line_length_chunk_sizes.size()));
 
   write_index(file, data.compressed_identifier_chunk_sizes);
   write_index(file, data.compressed_basecall_chunk_sizes);
   write_index(file, data.compressed_quality_chunk_sizes);
-  write_index(file, data.compressed_line_offset_chunk_sizes);
+  write_index(file, data.compressed_line_length_chunk_sizes);
 
   write_blob(file, data.identifiers.payload);
   write_blob(file, data.basecalls.payload);
   write_blob(file, data.quality_scores.payload);
-  write_blob(file, data.line_offsets.payload);
+  write_blob(file, data.line_lengths.payload);
 }
 
 CompressedFastqData deserialize(const std::string &filepath) {
@@ -156,19 +156,19 @@ CompressedFastqData deserialize(const std::string &filepath) {
   const uint64_t comp_qual_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_chunks = read_val<uint64_t>(file);
 
-  data.line_offsets.original_size = read_val<uint64_t>(file);
+  data.line_lengths.original_size = read_val<uint64_t>(file);
   const uint64_t comp_index_size = read_val<uint64_t>(file);
   const uint64_t comp_index_chunks = read_val<uint64_t>(file);
 
   data.compressed_identifier_chunk_sizes = read_index(file, comp_id_chunks);
   data.compressed_basecall_chunk_sizes = read_index(file, comp_seq_chunks);
   data.compressed_quality_chunk_sizes = read_index(file, comp_qual_chunks);
-  data.compressed_line_offset_chunk_sizes = read_index(file, comp_index_chunks);
+  data.compressed_line_length_chunk_sizes = read_index(file, comp_index_chunks);
 
   data.identifiers.payload = read_blob(file, comp_id_size);
   data.basecalls.payload = read_blob(file, comp_seq_size);
   data.quality_scores.payload = read_blob(file, comp_qual_size);
-  data.line_offsets.payload = read_blob(file, comp_index_size);
+  data.line_lengths.payload = read_blob(file, comp_index_size);
 
   return data;
 }

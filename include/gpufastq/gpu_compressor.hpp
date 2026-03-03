@@ -16,7 +16,7 @@ std::vector<uint8_t> gpu_compress(const std::vector<uint8_t> &input,
 /// Decompress a single buffer using GPU-accelerated zstd (nvcomp)
 std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed);
 
-/// Extract identifiers/basecalls/quality plus the line index and compress them.
+/// Extract identifiers/basecalls/quality plus delta-coded line lengths and compress them.
 CompressedFastqData compress_fastq(const FastqData &data,
                                    size_t chunk_size = DEFAULT_CHUNK_SIZE);
 

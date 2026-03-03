@@ -1,6 +1,7 @@
 #include "gpufastq/fastq_parser.hpp"
 
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -142,7 +143,15 @@ FastqFieldStats compute_field_stats(const FastqData &data) {
   validate_fastq_layout(data);
 
   FastqFieldStats stats;
-  stats.line_index_size = data.line_offsets.size() * sizeof(uint64_t);
+  if (!data.line_offsets.empty()) {
+    for (size_t i = 0; i + 1 < data.line_offsets.size(); ++i) {
+      const uint64_t line_length = data.line_offsets[i + 1] - data.line_offsets[i];
+      if (line_length > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("FASTQ line length exceeds uint32_t range");
+      }
+    }
+    stats.line_length_size = data.line_offsets.size() * sizeof(uint32_t);
+  }
   for (uint64_t record = 0; record < data.num_records; ++record) {
     const uint64_t id_line = 4 * record;
     const uint64_t seq_line = id_line + 1;

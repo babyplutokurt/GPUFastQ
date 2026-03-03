@@ -83,6 +83,7 @@ set_target_properties(nvcomp PROPERTIES
 # GPUFastQ Library
 # ============================================================
 add_library(gpufastq_lib
+    src/codec_gpu.cu
     src/codec_gpu_nvcomp.cu
     src/compression_workflow.cpp
     src/decompression_workflow.cpp

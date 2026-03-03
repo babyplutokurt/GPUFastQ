@@ -15,8 +15,9 @@ namespace gpufastq::workflow {
 
 namespace {
 
-long long elapsed_ms(const std::chrono::high_resolution_clock::time_point &start,
-                     const std::chrono::high_resolution_clock::time_point &end) {
+long long
+elapsed_ms(const std::chrono::high_resolution_clock::time_point &start,
+           const std::chrono::high_resolution_clock::time_point &end) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
       .count();
 }
@@ -34,24 +35,25 @@ int compress(const std::string &input_path, const std::string &output_path) {
 
   std::cerr << "Parsed " << data.num_records << " records\n"
             << "  FASTQ bytes:     " << data.raw_bytes.size() << " B\n"
-            << "  Line offsets:    " << data.line_offsets.size() << "\n"
+            << "  Line offsets:    " << data.line_offsets.size() << " B\n"
             << "  Identifiers:     " << stats.identifiers_size << " B\n"
             << "  Basecalls:       " << stats.basecalls_size << " B\n"
             << "  Quality scores:  " << stats.quality_scores_size << " B\n"
-            << "  Index bytes:     " << stats.line_index_size << " B\n";
+            << "  Line lengths:    " << stats.line_length_size << " B\n";
 
-  const size_t raw_payload_size = stats.identifiers_size + stats.basecalls_size +
-                                  stats.quality_scores_size +
-                                  stats.line_index_size;
+  const size_t raw_payload_size =
+      stats.identifiers_size + stats.basecalls_size +
+      stats.quality_scores_size + stats.line_length_size;
 
   std::cerr << "\n=== GPU Compression ===\n";
   const auto compressed = compress_fastq(data);
   const auto t2 = clock::now();
 
-  const size_t compressed_payload_size = compressed.identifiers.payload.size() +
-                                         compressed.basecalls.payload.size() +
-                                         compressed.quality_scores.payload.size() +
-                                         compressed.line_offsets.payload.size();
+  const size_t compressed_payload_size =
+      compressed.identifiers.payload.size() +
+      compressed.basecalls.payload.size() +
+      compressed.quality_scores.payload.size() +
+      compressed.line_lengths.payload.size();
 
   std::cerr << "\n=== Serializing: " << output_path << " ===\n";
   serialize(output_path, compressed);

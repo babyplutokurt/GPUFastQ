@@ -8,7 +8,7 @@ namespace gpufastq {
 /// Parse a FASTQ file into a raw byte buffer and a line-start index.
 FastqData parse_fastq(const std::string &filepath);
 
-/// Summarize the byte size of the extracted FASTQ field streams and index.
+/// Summarize the byte size of the extracted FASTQ field streams and line lengths.
 FastqFieldStats compute_field_stats(const FastqData &data);
 
 /// Write a FASTQ file from its raw byte representation.

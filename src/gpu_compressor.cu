@@ -1,3 +1,4 @@
+#include "gpufastq/codec_gpu.cuh"
 #include "gpufastq/codec_gpu_nvcomp.cuh"
 #include "gpufastq/gpu_compressor.hpp"
 #include "gpufastq/fastq_parser.hpp"
@@ -181,19 +182,6 @@ gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
   return output;
 }
 
-std::vector<uint64_t> decode_line_offsets(const std::vector<uint8_t> &bytes,
-                                          uint64_t line_offset_count) {
-  if (bytes.size() != line_offset_count * sizeof(uint64_t)) {
-    throw std::runtime_error("Decoded line-offset payload has an unexpected size");
-  }
-
-  std::vector<uint64_t> line_offsets(line_offset_count);
-  if (!bytes.empty()) {
-    std::memcpy(line_offsets.data(), bytes.data(), bytes.size());
-  }
-  return line_offsets;
-}
-
 FastqData rebuild_fastq(const std::vector<uint64_t> &line_offsets,
                         const std::vector<uint8_t> &identifiers,
                         const std::vector<uint8_t> &basecalls,
@@ -321,7 +309,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
   result.identifiers.original_size = stats.identifiers_size;
   result.basecalls.original_size = stats.basecalls_size;
   result.quality_scores.original_size = stats.quality_scores_size;
-  result.line_offsets.original_size = stats.line_index_size;
+  result.line_lengths.original_size = stats.line_length_size;
   result.line_offset_count = data.line_offsets.size();
 
   cudaStream_t stream;
@@ -335,6 +323,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
   uint64_t *d_identifier_offsets = nullptr;
   uint64_t *d_basecall_offsets = nullptr;
   uint64_t *d_quality_offsets = nullptr;
+  uint32_t *d_line_lengths = nullptr;
   DeviceFieldBuffers fields;
 
   try {
@@ -408,8 +397,16 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
           d_quality_lengths, fields.identifiers, fields.basecalls,
           fields.quality_scores, data.num_records);
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+
+    if (!data.line_offsets.empty()) {
+      const uint64_t line_length_count = data.line_offsets.size();
+      CUDA_CHECK(
+          cudaMalloc(&d_line_lengths, line_length_count * sizeof(uint32_t)));
+      delta_encode_offsets_to_lengths(d_line_offsets, d_line_lengths,
+                                      line_length_count, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::cerr << "Compressing identifiers (" << stats.identifiers_size
               << " bytes)..." << std::endl;
@@ -445,17 +442,18 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
     std::cerr << "  -> " << result.quality_scores.payload.size() << " bytes"
               << std::endl;
 
-    std::cerr << "Compressing line offsets (" << stats.line_index_size
+    std::cerr << "Compressing line lengths (" << stats.line_length_size
               << " bytes)..." << std::endl;
     auto index_chunks = gpu_compress_device_chunked(
-        reinterpret_cast<const uint8_t *>(d_line_offsets), stats.line_index_size,
+        reinterpret_cast<const uint8_t *>(d_line_lengths), stats.line_length_size,
         field_slice_size, chunk_size, stream);
-    result.line_offsets.payload = std::move(index_chunks.data);
-    result.compressed_line_offset_chunk_sizes =
+    result.line_lengths.payload = std::move(index_chunks.data);
+    result.compressed_line_length_chunk_sizes =
         std::move(index_chunks.chunk_sizes);
-    std::cerr << "  -> " << result.line_offsets.payload.size() << " bytes"
+    std::cerr << "  -> " << result.line_lengths.payload.size() << " bytes"
               << std::endl;
   } catch (...) {
+    cuda_free_if_set(d_line_lengths);
     cuda_free_if_set(fields.identifiers);
     cuda_free_if_set(fields.basecalls);
     cuda_free_if_set(fields.quality_scores);
@@ -471,6 +469,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size) {
     throw;
   }
 
+  cuda_free_if_set(d_line_lengths);
   cuda_free_if_set(fields.identifiers);
   cuda_free_if_set(fields.basecalls);
   cuda_free_if_set(fields.quality_scores);
@@ -508,15 +507,51 @@ FastqData decompress_fastq(const CompressedFastqData &compressed) {
                              compressed.quality_scores.original_size);
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
-  std::cerr << "Decompressing line offsets..." << std::endl;
+  std::cerr << "Decompressing line lengths..." << std::endl;
   const auto line_offset_bytes =
-      gpu_decompress_chunked(compressed.line_offsets.payload,
-                             compressed.compressed_line_offset_chunk_sizes,
-                             compressed.line_offsets.original_size);
+      gpu_decompress_chunked(compressed.line_lengths.payload,
+                             compressed.compressed_line_length_chunk_sizes,
+                             compressed.line_lengths.original_size);
   std::cerr << "  -> " << line_offset_bytes.size() << " bytes" << std::endl;
 
-  const auto line_offsets =
-      decode_line_offsets(line_offset_bytes, compressed.line_offset_count);
+  if (compressed.line_offset_count == 0) {
+    throw std::runtime_error("Decoded line-offset count is invalid");
+  }
+  if (line_offset_bytes.size() !=
+      compressed.line_offset_count * sizeof(uint32_t)) {
+    throw std::runtime_error(
+        "Decoded line-length payload has an unexpected size");
+  }
+
+  std::vector<uint64_t> line_offsets(compressed.line_offset_count);
+  uint32_t *d_line_lengths = nullptr;
+  uint64_t *d_line_offsets = nullptr;
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+
+  try {
+    CUDA_CHECK(cudaMalloc(&d_line_lengths, line_offset_bytes.size()));
+    CUDA_CHECK(cudaMalloc(&d_line_offsets,
+                          line_offsets.size() * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_line_lengths, line_offset_bytes.data(),
+                               line_offset_bytes.size(),
+                               cudaMemcpyHostToDevice, stream));
+    delta_decode_lengths_to_offsets(d_line_lengths, d_line_offsets,
+                                    line_offsets.size(), stream);
+    CUDA_CHECK(cudaMemcpyAsync(line_offsets.data(), d_line_offsets,
+                               line_offsets.size() * sizeof(uint64_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  } catch (...) {
+    cuda_free_if_set(d_line_offsets);
+    cuda_free_if_set(d_line_lengths);
+    cudaStreamDestroy(stream);
+    throw;
+  }
+
+  cuda_free_if_set(d_line_offsets);
+  cuda_free_if_set(d_line_lengths);
+  cudaStreamDestroy(stream);
   return rebuild_fastq(line_offsets, identifiers, basecalls, quality_scores,
                        compressed.num_records);
 }
