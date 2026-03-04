@@ -99,6 +99,8 @@ struct CompressedFastqData {
   CompressedBasecallData basecalls;
   ZstdCompressedBlock quality_scores;
   ZstdCompressedBlock line_lengths;
+  QualityLayoutKind quality_layout = QualityLayoutKind::FixedLength;
+  uint32_t fixed_quality_length = 0;
 
   std::vector<uint64_t> compressed_quality_chunk_sizes;
   std::vector<uint64_t> uncompressed_quality_chunk_sizes;

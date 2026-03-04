@@ -70,6 +70,56 @@ struct EncodedBasecallBuffers {
   uint16_t *n_positions = nullptr;
 };
 
+std::vector<uint8_t>
+transpose_fixed_length_quality_scores(const std::vector<uint8_t> &quality_scores,
+                                      uint64_t num_records,
+                                      uint32_t quality_length) {
+  if (quality_scores.empty()) {
+    return {};
+  }
+  if (num_records == 0 ||
+      quality_scores.size() != num_records * static_cast<uint64_t>(quality_length)) {
+    throw std::runtime_error(
+        "Fixed-length quality transpose received inconsistent input size");
+  }
+
+  std::vector<uint8_t> transposed(quality_scores.size());
+  for (uint32_t column = 0; column < quality_length; ++column) {
+    const uint64_t column_offset =
+        static_cast<uint64_t>(column) * num_records;
+    for (uint64_t record = 0; record < num_records; ++record) {
+      transposed[column_offset + record] =
+          quality_scores[record * static_cast<uint64_t>(quality_length) + column];
+    }
+  }
+  return transposed;
+}
+
+std::vector<uint8_t>
+inverse_transpose_fixed_length_quality_scores(
+    const std::vector<uint8_t> &transposed_quality_scores, uint64_t num_records,
+    uint32_t quality_length) {
+  if (transposed_quality_scores.empty()) {
+    return {};
+  }
+  if (num_records == 0 || transposed_quality_scores.size() !=
+                              num_records * static_cast<uint64_t>(quality_length)) {
+    throw std::runtime_error(
+        "Fixed-length quality inverse transpose received inconsistent input size");
+  }
+
+  std::vector<uint8_t> quality_scores(transposed_quality_scores.size());
+  for (uint32_t column = 0; column < quality_length; ++column) {
+    const uint64_t column_offset =
+        static_cast<uint64_t>(column) * num_records;
+    for (uint64_t record = 0; record < num_records; ++record) {
+      quality_scores[record * static_cast<uint64_t>(quality_length) + column] =
+          transposed_quality_scores[column_offset + record];
+    }
+  }
+  return quality_scores;
+}
+
 uint64_t sum_sizes(const std::vector<uint64_t> &sizes) {
   return std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
 }
@@ -1069,10 +1119,13 @@ FastqData rebuild_fastq(const std::vector<uint64_t> &line_offsets,
 
   const uint64_t file_size = line_offsets.back();
   data.raw_bytes.resize(file_size);
+  data.quality_lengths.resize(static_cast<size_t>(num_records), 0);
 
   uint64_t id_offset = 0;
   uint64_t seq_offset = 0;
   uint64_t qual_offset = 0;
+  bool fixed_quality_length_set = false;
+  uint32_t fixed_quality_length = 0;
 
   for (uint64_t record = 0; record < num_records; ++record) {
     const uint64_t id_line = 4 * record;
@@ -1090,6 +1143,17 @@ FastqData rebuild_fastq(const std::vector<uint64_t> &line_offsets,
     const uint64_t seq_len = plus_start - seq_start - 1;
     const uint64_t plus_len = qual_start - plus_start - 1;
     const uint64_t qual_len = next_start - qual_start - 1;
+    if (qual_len > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error("Decoded quality length exceeds uint32_t range");
+    }
+    data.quality_lengths[static_cast<size_t>(record)] =
+        static_cast<uint32_t>(qual_len);
+    if (!fixed_quality_length_set) {
+      fixed_quality_length = static_cast<uint32_t>(qual_len);
+      fixed_quality_length_set = true;
+    } else if (fixed_quality_length != static_cast<uint32_t>(qual_len)) {
+      data.quality_layout = QualityLayoutKind::VariableLength;
+    }
 
     if (plus_len != 1) {
       throw std::runtime_error("Decoded line-offset metadata is incompatible "
@@ -1127,6 +1191,16 @@ FastqData rebuild_fastq(const std::vector<uint64_t> &line_offsets,
       qual_offset != quality_scores.size()) {
     throw std::runtime_error(
         "Decoded FASTQ field streams contain trailing bytes outside the index");
+  }
+
+  if (num_records == 0) {
+    data.quality_layout = QualityLayoutKind::FixedLength;
+    data.fixed_quality_length = 0;
+  } else if (data.quality_layout == QualityLayoutKind::VariableLength) {
+    data.fixed_quality_length = 0;
+  } else {
+    data.quality_layout = QualityLayoutKind::FixedLength;
+    data.fixed_quality_length = fixed_quality_length;
   }
 
   return data;
@@ -1181,6 +1255,11 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   result.num_records = data.num_records;
   result.identifiers.original_size = stats.identifiers_size;
   result.quality_scores.original_size = stats.quality_scores_size;
+  result.quality_layout = data.quality_layout;
+  result.fixed_quality_length =
+      data.quality_layout == QualityLayoutKind::FixedLength
+          ? data.fixed_quality_length
+          : 0;
   result.line_lengths.original_size = stats.line_length_size;
   result.line_offset_count = data.line_offsets.size();
   const bool use_columnar_identifiers = data.identifier_layout.columnar;
@@ -1387,7 +1466,19 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    auto qual_chunks = bsc_compress_chunked(h_quality_scores.data(),
+    std::vector<uint8_t> quality_payload_for_compression;
+    const uint8_t *quality_input = h_quality_scores.data();
+    if (data.quality_layout == QualityLayoutKind::FixedLength &&
+        data.fixed_quality_length != 0) {
+      quality_payload_for_compression = transpose_fixed_length_quality_scores(
+          h_quality_scores, data.num_records, data.fixed_quality_length);
+      quality_input = quality_payload_for_compression.data();
+      std::cerr << "  Layout: column-major fixed-length ("
+                << data.fixed_quality_length << " bases)" << std::endl;
+    } else {
+      std::cerr << "  Layout: row-major variable-length" << std::endl;
+    }
+    auto qual_chunks = bsc_compress_chunked(quality_input,
                                             stats.quality_scores_size,
                                             BSC_QUALITY_CHUNK_SIZE,
                                             bsc_config);
@@ -1475,6 +1566,18 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
       compressed.compressed_quality_chunk_sizes,
       compressed.uncompressed_quality_chunk_sizes,
       compressed.quality_scores.original_size, bsc_config);
+  std::vector<uint8_t> reordered_quality_scores;
+  const std::vector<uint8_t> *quality_scores_for_rebuild = &quality_scores;
+  if (compressed.quality_layout == QualityLayoutKind::FixedLength &&
+      compressed.fixed_quality_length != 0) {
+    reordered_quality_scores = inverse_transpose_fixed_length_quality_scores(
+        quality_scores, compressed.num_records, compressed.fixed_quality_length);
+    quality_scores_for_rebuild = &reordered_quality_scores;
+    std::cerr << "  Layout: column-major fixed-length ("
+              << compressed.fixed_quality_length << " bases)" << std::endl;
+  } else {
+    std::cerr << "  Layout: row-major variable-length" << std::endl;
+  }
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing line lengths..." << std::endl;
@@ -1522,7 +1625,8 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   cuda_free_if_set(d_line_offsets);
   cuda_free_if_set(d_line_lengths);
   cudaStreamDestroy(stream);
-  return rebuild_fastq(line_offsets, identifiers, basecalls, quality_scores,
+  return rebuild_fastq(line_offsets, identifiers, basecalls,
+                       *quality_scores_for_rebuild,
                        compressed.num_records);
 }
 

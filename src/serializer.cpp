@@ -237,6 +237,26 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
+  if (data.quality_layout != QualityLayoutKind::FixedLength &&
+      data.quality_layout != QualityLayoutKind::VariableLength) {
+    throw std::runtime_error("Cannot serialize unknown quality layout");
+  }
+  if (data.quality_layout == QualityLayoutKind::FixedLength) {
+    if (data.num_records == 0) {
+      if (data.fixed_quality_length != 0) {
+        throw std::runtime_error(
+            "Cannot serialize empty FASTQ with fixed quality length");
+      }
+    } else if (data.quality_scores.original_size !=
+               static_cast<uint64_t>(data.fixed_quality_length) *
+                   data.num_records) {
+      throw std::runtime_error(
+          "Cannot serialize fixed-length quality metadata with inconsistent size");
+    }
+  } else if (data.fixed_quality_length != 0) {
+    throw std::runtime_error(
+        "Cannot serialize variable-length quality metadata with fixed length");
+  }
   if ((!data.compressed_quality_chunk_sizes.empty()) !=
       (!data.uncompressed_quality_chunk_sizes.empty())) {
     throw std::runtime_error(
@@ -283,6 +303,8 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file, static_cast<uint64_t>(
                      data.basecalls.compressed_n_position_chunk_sizes.size()));
 
+  write_val(file, static_cast<uint8_t>(data.quality_layout));
+  write_val(file, data.fixed_quality_length);
   write_val(file, static_cast<uint64_t>(data.quality_scores.original_size));
   write_val(file, static_cast<uint64_t>(data.quality_scores.payload.size()));
   write_val(file,
@@ -374,6 +396,8 @@ CompressedFastqData deserialize(const std::string &filepath) {
   const uint64_t comp_n_pos_size = read_val<uint64_t>(file);
   const uint64_t comp_n_pos_chunks = read_val<uint64_t>(file);
 
+  data.quality_layout = static_cast<QualityLayoutKind>(read_val<uint8_t>(file));
+  data.fixed_quality_length = read_val<uint32_t>(file);
   data.quality_scores.original_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_chunks = read_val<uint64_t>(file);
@@ -439,6 +463,12 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.basecalls.n_positions.payload = read_blob(file, comp_n_pos_size);
   data.quality_scores.payload = read_blob(file, comp_qual_size);
   data.line_lengths.payload = read_blob(file, comp_index_size);
+
+  validate_identifier_stream(data.identifiers, data.num_records);
+  validate_basecall_stream(data.basecalls);
+  validate_chunked_stream(data.quality_scores.payload,
+                          data.quality_scores.original_size,
+                          data.compressed_quality_chunk_sizes, "quality");
 
   return data;
 }
