@@ -1,6 +1,11 @@
 data/
-./data
 build/
-./build
 .cache/
-./.cache
+.idea/
+*.gpufq
+*.tmp
+.vscode/
+.idea/
+.clangd
+*.fastq
+*.fq
