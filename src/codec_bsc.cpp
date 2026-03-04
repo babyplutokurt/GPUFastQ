@@ -142,6 +142,33 @@ ResolvedBscConfig resolve_bsc_config(const BscConfig &config, size_t task_count)
   };
 }
 
+void initialize_bsc_backend(BscBackend backend) { bsc_check_init(backend); }
+
+std::vector<uint8_t> bsc_compress_block(const uint8_t *input, size_t input_size,
+                                        BscBackend backend) {
+  if (input_size == 0) {
+    return {};
+  }
+  if (input == nullptr) {
+    throw std::runtime_error("BSC block compression input pointer is null");
+  }
+  if (input_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("BSC block exceeds supported size");
+  }
+
+  const int features = bsc_features_for_backend(backend);
+  std::vector<uint8_t> compressed(input_size + LIBBSC_HEADER_SIZE);
+  const int compressed_size = bsc_compress(
+      input, compressed.data(), static_cast<int>(input_size), 16, 128,
+      LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE, features);
+  if (compressed_size < LIBBSC_NO_ERROR) {
+    throw std::runtime_error("BSC compression failed with code: " +
+                             std::to_string(compressed_size));
+  }
+  compressed.resize(static_cast<size_t>(compressed_size));
+  return compressed;
+}
+
 BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
                                       size_t chunk_size,
                                       const BscConfig &config) {
@@ -159,8 +186,7 @@ BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
   const size_t chunk_count = (input_size + chunk_size - 1) / chunk_size;
   const auto resolved = resolve_bsc_config(config, chunk_count);
   const BscBackend backend = resolved.backend;
-  const int features = bsc_features_for_backend(backend);
-  bsc_check_init(backend);
+  initialize_bsc_backend(backend);
 
   std::vector<std::vector<uint8_t>> compressed_chunks(chunk_count);
   result.compressed_chunk_sizes.resize(chunk_count);
@@ -183,26 +209,10 @@ BscChunkedBuffer bsc_compress_chunked(const uint8_t *input, size_t input_size,
         const size_t offset = chunk_index * chunk_size;
         const size_t current_chunk_size =
             std::min(chunk_size, input_size - offset);
-        if (current_chunk_size >
-            static_cast<size_t>(std::numeric_limits<int>::max())) {
-          throw std::runtime_error("BSC chunk exceeds supported size");
-        }
-
-        const int input_chunk_size = static_cast<int>(current_chunk_size);
-        std::vector<uint8_t> compressed(current_chunk_size + LIBBSC_HEADER_SIZE);
-
-        const int compressed_size = bsc_compress(
-            input + offset, compressed.data(), input_chunk_size, 16, 128,
-            LIBBSC_BLOCKSORTER_BWT, LIBBSC_CODER_QLFC_ADAPTIVE,
-            features);
-        if (compressed_size < LIBBSC_NO_ERROR) {
-          throw std::runtime_error("BSC compression failed with code: " +
-                                   std::to_string(compressed_size));
-        }
-
-        compressed.resize(static_cast<size_t>(compressed_size));
+        auto compressed =
+            bsc_compress_block(input + offset, current_chunk_size, backend);
         result.compressed_chunk_sizes[chunk_index] =
-            static_cast<uint64_t>(compressed_size);
+            static_cast<uint64_t>(compressed.size());
         result.uncompressed_chunk_sizes[chunk_index] = current_chunk_size;
         compressed_chunks[chunk_index] = std::move(compressed);
       }

@@ -13,12 +13,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace gpufastq {
 
@@ -72,6 +75,12 @@ ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
                                                     size_t field_slice_size,
                                                     size_t nvcomp_chunk_size,
                                                     cudaStream_t stream);
+
+BscChunkedBuffer bsc_compress_device_chunked(const uint8_t *d_input,
+                                             size_t input_size,
+                                             size_t chunk_size,
+                                             const BscConfig &config,
+                                             cudaStream_t stream);
 
 struct DeviceFieldBuffers {
   uint8_t *identifiers = nullptr;
@@ -1370,6 +1379,153 @@ gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
   return output;
 }
 
+BscChunkedBuffer bsc_compress_device_chunked(const uint8_t *d_input,
+                                             size_t input_size,
+                                             size_t chunk_size,
+                                             const BscConfig &config,
+                                             cudaStream_t stream) {
+  BscChunkedBuffer result;
+  if (input_size == 0) {
+    return result;
+  }
+  if (d_input == nullptr) {
+    throw std::runtime_error("BSC device compression input pointer is null");
+  }
+  if (chunk_size == 0) {
+    throw std::runtime_error("BSC compression chunk size must be non-zero");
+  }
+
+  const size_t chunk_count = (input_size + chunk_size - 1) / chunk_size;
+  const auto resolved = resolve_bsc_config(config, chunk_count);
+  initialize_bsc_backend(resolved.backend);
+
+  struct LoadedChunk {
+    size_t index = 0;
+    std::vector<uint8_t> data;
+  };
+
+  std::deque<LoadedChunk> queue;
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  const size_t max_queue_depth = std::max<size_t>(1, resolved.parallelism * 2);
+  bool producer_done = false;
+  std::exception_ptr worker_error;
+  std::mutex error_mutex;
+  std::atomic<bool> failed{false};
+
+  std::vector<std::vector<uint8_t>> compressed_chunks(chunk_count);
+  result.compressed_chunk_sizes.resize(chunk_count);
+  result.uncompressed_chunk_sizes.resize(chunk_count);
+
+  const auto worker = [&]() {
+    try {
+      while (true) {
+        LoadedChunk chunk;
+        {
+          std::unique_lock<std::mutex> lock(queue_mutex);
+          queue_cv.wait(lock, [&]() {
+            return failed.load(std::memory_order_relaxed) || !queue.empty() ||
+                   producer_done;
+          });
+          if (failed.load(std::memory_order_relaxed)) {
+            return;
+          }
+          if (queue.empty()) {
+            if (producer_done) {
+              return;
+            }
+            continue;
+          }
+          chunk = std::move(queue.front());
+          queue.pop_front();
+        }
+        queue_cv.notify_all();
+
+        auto compressed =
+            bsc_compress_block(chunk.data.data(), chunk.data.size(),
+                               resolved.backend);
+        result.compressed_chunk_sizes[chunk.index] =
+            static_cast<uint64_t>(compressed.size());
+        result.uncompressed_chunk_sizes[chunk.index] = chunk.data.size();
+        compressed_chunks[chunk.index] = std::move(compressed);
+      }
+    } catch (...) {
+      failed.store(true, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (worker_error == nullptr) {
+        worker_error = std::current_exception();
+      }
+      queue_cv.notify_all();
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(resolved.parallelism);
+  for (size_t i = 0; i < resolved.parallelism; ++i) {
+    workers.emplace_back(worker);
+  }
+
+  try {
+    for (size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+      if (failed.load(std::memory_order_relaxed)) {
+        break;
+      }
+
+      const size_t offset = chunk_index * chunk_size;
+      const size_t current_chunk_size =
+          std::min(chunk_size, input_size - offset);
+      std::vector<uint8_t> host_chunk(current_chunk_size);
+      CUDA_CHECK(cudaMemcpyAsync(host_chunk.data(), d_input + offset,
+                                 current_chunk_size, cudaMemcpyDeviceToHost,
+                                 stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      std::unique_lock<std::mutex> lock(queue_mutex);
+      queue_cv.wait(lock, [&]() {
+        return failed.load(std::memory_order_relaxed) ||
+               queue.size() < max_queue_depth;
+      });
+      if (failed.load(std::memory_order_relaxed)) {
+        break;
+      }
+      queue.push_back(LoadedChunk{chunk_index, std::move(host_chunk)});
+      lock.unlock();
+      queue_cv.notify_all();
+    }
+  } catch (...) {
+    failed.store(true, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (worker_error == nullptr) {
+        worker_error = std::current_exception();
+      }
+    }
+    queue_cv.notify_all();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    producer_done = true;
+  }
+  queue_cv.notify_all();
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+  if (worker_error != nullptr) {
+    std::rethrow_exception(worker_error);
+  }
+
+  size_t total_compressed_size = 0;
+  for (uint64_t size : result.compressed_chunk_sizes) {
+    total_compressed_size += static_cast<size_t>(size);
+  }
+  result.data.reserve(total_compressed_size);
+  for (auto &compressed : compressed_chunks) {
+    result.data.insert(result.data.end(), compressed.begin(), compressed.end());
+  }
+  return result;
+}
+
 CompressedBasecallData compress_basecalls_device(const uint8_t *d_basecalls,
                                                  uint64_t basecall_count,
                                                  size_t field_slice_size,
@@ -1940,13 +2096,6 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
               << ", jobs: " << resolved_bsc.parallelism
               << ", chunks: " << quality_chunk_count << std::endl;
-    std::vector<uint8_t> h_quality_scores(stats.quality_scores_size);
-    if (stats.quality_scores_size > 0) {
-      CUDA_CHECK(cudaMemcpyAsync(h_quality_scores.data(), fields.quality_scores,
-                                 stats.quality_scores_size,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
     if (data.quality_layout == QualityLayoutKind::FixedLength &&
         data.fixed_quality_length != 0) {
       std::cerr << "  Layout: row-major fixed-length (column-major disabled)"
@@ -1954,10 +2103,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     } else {
       std::cerr << "  Layout: row-major variable-length" << std::endl;
     }
-    auto qual_chunks = bsc_compress_chunked(h_quality_scores.data(),
-                                            stats.quality_scores_size,
-                                            BSC_QUALITY_CHUNK_SIZE,
-                                            bsc_config);
+    auto qual_chunks = bsc_compress_device_chunked(
+        fields.quality_scores, stats.quality_scores_size,
+        BSC_QUALITY_CHUNK_SIZE, bsc_config, stream);
     result.quality_scores.payload = std::move(qual_chunks.data);
     result.compressed_quality_chunk_sizes =
         std::move(qual_chunks.compressed_chunk_sizes);
