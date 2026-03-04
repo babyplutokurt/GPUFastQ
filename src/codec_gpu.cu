@@ -4,6 +4,10 @@
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
+#include <thrust/copy.h>
+#include <thrust/count.h>
+#include <thrust/device_ptr.h>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <algorithm>
 #include <limits>
@@ -76,7 +80,62 @@ __global__ void compute_quality_lengths_kernel(const uint64_t *line_offsets,
   quality_lengths[idx] = static_cast<uint32_t>(length);
 }
 
+struct IsNewline {
+  __host__ __device__ bool operator()(uint8_t value) const {
+    return value == static_cast<uint8_t>('\n');
+  }
+};
+
 } // namespace
+
+std::vector<uint64_t>
+build_line_offsets_gpu(const std::vector<uint8_t> &raw_bytes,
+                       cudaStream_t stream) {
+  if (raw_bytes.empty()) {
+    return {0};
+  }
+
+  uint8_t *d_raw_bytes = nullptr;
+  uint64_t *d_line_offsets = nullptr;
+
+  try {
+    const uint64_t file_size = static_cast<uint64_t>(raw_bytes.size());
+    CUDA_CHECK(cudaMalloc(&d_raw_bytes, raw_bytes.size()));
+    CUDA_CHECK(cudaMemcpyAsync(d_raw_bytes, raw_bytes.data(), raw_bytes.size(),
+                               cudaMemcpyHostToDevice, stream));
+
+    auto d_bytes = thrust::device_pointer_cast(d_raw_bytes);
+    const uint64_t internal_count = thrust::count_if(
+        thrust::cuda::par.on(stream), d_bytes, d_bytes + (file_size - 1),
+        IsNewline{});
+
+    std::vector<uint64_t> line_offsets(static_cast<size_t>(internal_count + 2));
+    line_offsets.front() = 0;
+    line_offsets.back() = file_size;
+
+    if (internal_count > 0) {
+      CUDA_CHECK(cudaMalloc(&d_line_offsets,
+                            internal_count * sizeof(uint64_t)));
+      auto idx_begin = thrust::make_counting_iterator<uint64_t>(1);
+      auto idx_end = thrust::make_counting_iterator<uint64_t>(file_size);
+      auto d_output = thrust::device_pointer_cast(d_line_offsets);
+      thrust::copy_if(thrust::cuda::par.on(stream), idx_begin, idx_end, d_bytes,
+                      d_output, IsNewline{});
+      CUDA_CHECK(cudaMemcpyAsync(line_offsets.data() + 1, d_line_offsets,
+                                 internal_count * sizeof(uint64_t),
+                                 cudaMemcpyDeviceToHost, stream));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cuda_free_if_set(d_line_offsets);
+    cuda_free_if_set(d_raw_bytes);
+    return line_offsets;
+  } catch (...) {
+    cuda_free_if_set(d_line_offsets);
+    cuda_free_if_set(d_raw_bytes);
+    throw;
+  }
+}
 
 void delta_encode_offsets_to_lengths(const uint64_t *d_offsets,
                                      uint32_t *d_lengths, size_t count,

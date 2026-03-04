@@ -11,6 +11,7 @@
 #include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <iostream>
@@ -1706,6 +1707,8 @@ std::vector<uint8_t> gpu_decompress(const std::vector<uint8_t> &compressed) {
 
 CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                    const BscConfig &bsc_config) {
+  using Clock = std::chrono::steady_clock;
+  const auto compression_start = Clock::now();
   const FastqFieldStats stats = compute_field_stats(data);
   const size_t field_slice_size = MAX_FIELD_SLICE_SIZE;
 
@@ -1734,8 +1737,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   uint64_t *d_quality_offsets = nullptr;
   uint32_t *d_line_lengths = nullptr;
   DeviceFieldBuffers fields;
+  long long field_prep_ms = 0;
+  long long identifier_ms = 0;
+  long long basecall_ms = 0;
+  long long quality_ms = 0;
+  long long line_length_ms = 0;
 
   try {
+    const auto field_prep_start = Clock::now();
     if (!data.raw_bytes.empty()) {
       CUDA_CHECK(cudaMalloc(&d_raw_bytes, data.raw_bytes.size()));
       CUDA_CHECK(cudaMemcpyAsync(d_raw_bytes, data.raw_bytes.data(),
@@ -1817,9 +1826,13 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                       line_length_count, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    field_prep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - field_prep_start)
+                        .count();
 
     std::cerr << "Compressing identifiers (" << stats.identifiers_size
               << " bytes)..." << std::endl;
+    const auto identifier_start = Clock::now();
     if (use_columnar_identifiers) {
       result.identifiers =
           compress_identifiers_columnar(data, d_raw_bytes, d_line_offsets,
@@ -1875,9 +1888,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
       std::cerr << "  -> " << result.identifiers.flat_data.payload.size()
                 << " bytes" << std::endl;
     }
+    identifier_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - identifier_start)
+                        .count();
+    std::cerr << "  Time: " << identifier_ms << " ms" << std::endl;
 
     std::cerr << "Compressing basecalls (" << stats.basecalls_size
               << " bytes)..." << std::endl;
+    const auto basecall_start = Clock::now();
     result.basecalls = compress_basecalls_device(fields.basecalls,
                                                  stats.basecalls_size,
                                                  field_slice_size, chunk_size,
@@ -1904,9 +1922,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "  Packed bases: " << result.basecalls.packed_bases.original_size
               << " bytes, N positions: " << total_n_count << std::endl;
     std::cerr << "  -> " << compressed_basecall_size << " bytes" << std::endl;
+    basecall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      Clock::now() - basecall_start)
+                      .count();
+    std::cerr << "  Time: " << basecall_ms << " ms" << std::endl;
 
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
               << " bytes)..." << std::endl;
+    const auto quality_start = Clock::now();
     const size_t quality_chunk_count =
         stats.quality_scores_size == 0
             ? 0
@@ -1942,9 +1965,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
         std::move(qual_chunks.uncompressed_chunk_sizes);
     std::cerr << "  -> " << result.quality_scores.payload.size() << " bytes"
               << std::endl;
+    quality_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     Clock::now() - quality_start)
+                     .count();
+    std::cerr << "  Time: " << quality_ms << " ms" << std::endl;
 
     std::cerr << "Compressing line lengths (" << stats.line_length_size
               << " bytes)..." << std::endl;
+    const auto line_length_start = Clock::now();
     auto index_chunks = gpu_compress_device_chunked(
         reinterpret_cast<const uint8_t *>(d_line_lengths),
         stats.line_length_size, field_slice_size, chunk_size, stream);
@@ -1953,6 +1981,20 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
         std::move(index_chunks.chunk_sizes);
     std::cerr << "  -> " << result.line_lengths.payload.size() << " bytes"
               << std::endl;
+    line_length_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         Clock::now() - line_length_start)
+                         .count();
+    std::cerr << "  Time: " << line_length_ms << " ms" << std::endl;
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              Clock::now() - compression_start)
+                              .count();
+    std::cerr << "Compression stage timings:" << std::endl;
+    std::cerr << "  Field prep:      " << field_prep_ms << " ms" << std::endl;
+    std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
+    std::cerr << "  Basecalls:       " << basecall_ms << " ms" << std::endl;
+    std::cerr << "  Quality scores:  " << quality_ms << " ms" << std::endl;
+    std::cerr << "  Line lengths:    " << line_length_ms << " ms" << std::endl;
+    std::cerr << "  Total compress:  " << total_ms << " ms" << std::endl;
   } catch (...) {
     cuda_free_if_set(d_line_lengths);
     cuda_free_if_set(fields.identifiers);

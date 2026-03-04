@@ -8,3 +8,4 @@ build/
 .idea/
 .clangd
 *.fastq
+*.fq

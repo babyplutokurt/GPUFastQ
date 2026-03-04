@@ -16,6 +16,12 @@ struct QualityLengthAnalysis {
   uint32_t fixed_length = 0;
 };
 
+// Build FASTQ line-start offsets from the raw byte stream on GPU.
+// The returned vector always starts with 0 and ends with raw_bytes.size().
+std::vector<uint64_t>
+build_line_offsets_gpu(const std::vector<uint8_t> &raw_bytes,
+                       cudaStream_t stream = 0);
+
 // Delta-encode a monotonic offset vector into same-length uint32 deltas.
 // The first output element is copied from the first offset, which is expected
 // to be 0 for FASTQ line offsets.

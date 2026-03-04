@@ -263,14 +263,7 @@ FastqData parse_fastq(const std::string &filepath) {
     return data;
   }
 
-  data.line_offsets.reserve(data.raw_bytes.size() / 40 + 2);
-  data.line_offsets.push_back(0);
-  for (uint64_t i = 0; i < data.raw_bytes.size(); ++i) {
-    if (data.raw_bytes[i] == '\n' && (i + 1) < data.raw_bytes.size()) {
-      data.line_offsets.push_back(i + 1);
-    }
-  }
-  data.line_offsets.push_back(data.raw_bytes.size());
+  data.line_offsets = build_line_offsets_gpu(data.raw_bytes);
   data.num_records = (data.line_offsets.size() - 1) / 4;
 
   validate_fastq_layout(data);
