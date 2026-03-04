@@ -9,6 +9,11 @@ namespace gpufastq {
 
 constexpr size_t BSC_QUALITY_CHUNK_SIZE = 8 * 1024 * 1024;
 
+enum class QualityCodec : uint8_t {
+  Bsc = 0,
+  Zstd = 1,
+};
+
 enum class BscBackend {
   Default,
   Cpu,
@@ -16,6 +21,7 @@ enum class BscBackend {
 };
 
 struct BscConfig {
+  QualityCodec quality_codec = QualityCodec::Bsc;
   BscBackend backend = BscBackend::Default;
   size_t threads = 0;
   size_t gpu_jobs = 0;
@@ -33,6 +39,7 @@ struct BscChunkedBuffer {
 };
 
 std::string_view bsc_backend_name(BscBackend backend);
+std::string_view quality_codec_name(QualityCodec codec);
 
 ResolvedBscConfig resolve_bsc_config(const BscConfig &config,
                                      size_t task_count);

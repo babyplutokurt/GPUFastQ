@@ -1,5 +1,7 @@
 #pragma once
 
+#include "codec_bsc.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -99,6 +101,7 @@ struct CompressedFastqData {
   CompressedBasecallData basecalls;
   ZstdCompressedBlock quality_scores;
   ZstdCompressedBlock line_lengths;
+  QualityCodec quality_codec = QualityCodec::Bsc;
   QualityLayoutKind quality_layout = QualityLayoutKind::FixedLength;
   uint32_t fixed_quality_length = 0;
 

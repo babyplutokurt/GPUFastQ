@@ -30,6 +30,16 @@ gpufastq::BscBackend parse_bsc_backend_arg(const std::string &value) {
   throw std::runtime_error("--bsc-backend must be 'cpu' or 'cuda'");
 }
 
+gpufastq::QualityCodec parse_quality_codec_arg(const std::string &value) {
+  if (value == "bsc") {
+    return gpufastq::QualityCodec::Bsc;
+  }
+  if (value == "zstd") {
+    return gpufastq::QualityCodec::Zstd;
+  }
+  throw std::runtime_error("--quality-codec must be 'bsc' or 'zstd'");
+}
+
 } // namespace
 
 void print_usage(const char *prog) {
@@ -42,6 +52,7 @@ void print_usage(const char *prog) {
             << "  " << prog
             << " roundtrip  [options] <input.fastq>\n\n"
             << "Options:\n"
+            << "  --quality-codec C  Quality codec: bsc or zstd\n"
             << "  --bsc-backend B    BSC backend for quality scores: cpu or cuda\n"
             << "  --bsc-threads N    Override CPU worker count for CPU BSC mode\n"
             << "  --bsc-gpu-jobs N   Override concurrent chunk jobs for CUDA BSC mode\n\n"
@@ -66,13 +77,15 @@ int main(int argc, char *argv[]) {
 
     for (int argi = 2; argi < argc; ++argi) {
       const std::string arg = argv[argi];
-      if (arg == "--bsc-backend" || arg == "--bsc-threads" ||
+      if (arg == "--quality-codec" || arg == "--bsc-backend" || arg == "--bsc-threads" ||
           arg == "--bsc-gpu-jobs") {
         if (argi + 1 >= argc) {
           throw std::runtime_error("Missing value for " + arg);
         }
         const std::string value = argv[++argi];
-        if (arg == "--bsc-backend") {
+        if (arg == "--quality-codec") {
+          bsc_config.quality_codec = parse_quality_codec_arg(value);
+        } else if (arg == "--bsc-backend") {
           bsc_config.backend = parse_bsc_backend_arg(value);
         } else if (arg == "--bsc-threads") {
           bsc_config.threads = parse_positive_size_arg(arg, value);

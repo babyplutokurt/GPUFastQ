@@ -234,9 +234,17 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
 
   validate_identifier_stream(data.identifiers, data.num_records);
   validate_basecall_stream(data.basecalls);
+  if (data.quality_codec != QualityCodec::Bsc &&
+      data.quality_codec != QualityCodec::Zstd) {
+    throw std::runtime_error("Decoded unknown quality codec");
+  }
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
+  if (data.quality_codec != QualityCodec::Bsc &&
+      data.quality_codec != QualityCodec::Zstd) {
+    throw std::runtime_error("Cannot serialize unknown quality codec");
+  }
   if (data.quality_layout != QualityLayoutKind::FixedLength &&
       data.quality_layout != QualityLayoutKind::VariableLength) {
     throw std::runtime_error("Cannot serialize unknown quality layout");
@@ -303,6 +311,7 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file, static_cast<uint64_t>(
                      data.basecalls.compressed_n_position_chunk_sizes.size()));
 
+  write_val(file, static_cast<uint8_t>(data.quality_codec));
   write_val(file, static_cast<uint8_t>(data.quality_layout));
   write_val(file, data.fixed_quality_length);
   write_val(file, static_cast<uint64_t>(data.quality_scores.original_size));
@@ -396,6 +405,7 @@ CompressedFastqData deserialize(const std::string &filepath) {
   const uint64_t comp_n_pos_size = read_val<uint64_t>(file);
   const uint64_t comp_n_pos_chunks = read_val<uint64_t>(file);
 
+  data.quality_codec = static_cast<QualityCodec>(read_val<uint8_t>(file));
   data.quality_layout = static_cast<QualityLayoutKind>(read_val<uint8_t>(file));
   data.fixed_quality_length = read_val<uint32_t>(file);
   data.quality_scores.original_size = read_val<uint64_t>(file);
@@ -469,7 +479,6 @@ CompressedFastqData deserialize(const std::string &filepath) {
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
-
   return data;
 }
 

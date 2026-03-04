@@ -1872,6 +1872,7 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   result.num_records = data.num_records;
   result.identifiers.original_size = stats.identifiers_size;
   result.quality_scores.original_size = stats.quality_scores_size;
+  result.quality_codec = bsc_config.quality_codec;
   // Deprecated for now: keep fixed/variable detection in FastqData, but store
   // quality scores in the original row-major layout for all files.
   result.quality_layout = QualityLayoutKind::VariableLength;
@@ -2086,16 +2087,6 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
               << " bytes)..." << std::endl;
     const auto quality_start = Clock::now();
-    const size_t quality_chunk_count =
-        stats.quality_scores_size == 0
-            ? 0
-            : (stats.quality_scores_size + BSC_QUALITY_CHUNK_SIZE - 1) /
-                  BSC_QUALITY_CHUNK_SIZE;
-    const auto resolved_bsc =
-        resolve_bsc_config(bsc_config, quality_chunk_count);
-    std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
-              << ", jobs: " << resolved_bsc.parallelism
-              << ", chunks: " << quality_chunk_count << std::endl;
     if (data.quality_layout == QualityLayoutKind::FixedLength &&
         data.fixed_quality_length != 0) {
       std::cerr << "  Layout: row-major fixed-length (column-major disabled)"
@@ -2103,14 +2094,44 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     } else {
       std::cerr << "  Layout: row-major variable-length" << std::endl;
     }
-    auto qual_chunks = bsc_compress_device_chunked(
-        fields.quality_scores, stats.quality_scores_size,
-        BSC_QUALITY_CHUNK_SIZE, bsc_config, stream);
-    result.quality_scores.payload = std::move(qual_chunks.data);
-    result.compressed_quality_chunk_sizes =
-        std::move(qual_chunks.compressed_chunk_sizes);
-    result.uncompressed_quality_chunk_sizes =
-        std::move(qual_chunks.uncompressed_chunk_sizes);
+    std::cerr << "  Codec: " << quality_codec_name(bsc_config.quality_codec)
+              << std::endl;
+    result.compressed_quality_chunk_sizes.clear();
+    result.uncompressed_quality_chunk_sizes.clear();
+    if (bsc_config.quality_codec == QualityCodec::Zstd) {
+      auto qual_chunks = gpu_compress_device_chunked(
+          fields.quality_scores, stats.quality_scores_size, field_slice_size,
+          chunk_size, stream);
+      result.quality_scores.payload = std::move(qual_chunks.data);
+      result.compressed_quality_chunk_sizes =
+          std::move(qual_chunks.chunk_sizes);
+      result.uncompressed_quality_chunk_sizes.reserve(
+          result.compressed_quality_chunk_sizes.size());
+      for (size_t offset = 0; offset < stats.quality_scores_size;
+           offset += field_slice_size) {
+        result.uncompressed_quality_chunk_sizes.push_back(std::min(
+            field_slice_size, static_cast<size_t>(stats.quality_scores_size - offset)));
+      }
+    } else {
+      const size_t quality_chunk_count =
+          stats.quality_scores_size == 0
+              ? 0
+              : (stats.quality_scores_size + BSC_QUALITY_CHUNK_SIZE - 1) /
+                    BSC_QUALITY_CHUNK_SIZE;
+      const auto resolved_bsc =
+          resolve_bsc_config(bsc_config, quality_chunk_count);
+      std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
+                << ", jobs: " << resolved_bsc.parallelism
+                << ", chunks: " << quality_chunk_count << std::endl;
+      auto qual_chunks = bsc_compress_device_chunked(
+          fields.quality_scores, stats.quality_scores_size,
+          BSC_QUALITY_CHUNK_SIZE, bsc_config, stream);
+      result.quality_scores.payload = std::move(qual_chunks.data);
+      result.compressed_quality_chunk_sizes =
+          std::move(qual_chunks.compressed_chunk_sizes);
+      result.uncompressed_quality_chunk_sizes =
+          std::move(qual_chunks.uncompressed_chunk_sizes);
+    }
     std::cerr << "  -> " << result.quality_scores.payload.size() << " bytes"
               << std::endl;
     quality_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2198,17 +2219,27 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
-  const auto resolved_bsc = resolve_bsc_config(
-      bsc_config, compressed.compressed_quality_chunk_sizes.size());
-  std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
-            << ", jobs: " << resolved_bsc.parallelism
-            << ", chunks: " << compressed.compressed_quality_chunk_sizes.size()
+  std::cerr << "  Codec: " << quality_codec_name(compressed.quality_codec)
             << std::endl;
-  const auto quality_scores = bsc_decompress_chunked(
-      compressed.quality_scores.payload,
-      compressed.compressed_quality_chunk_sizes,
-      compressed.uncompressed_quality_chunk_sizes,
-      compressed.quality_scores.original_size, bsc_config);
+  std::vector<uint8_t> quality_scores;
+  if (compressed.quality_codec == QualityCodec::Zstd) {
+    quality_scores = gpu_decompress_chunked(
+        compressed.quality_scores.payload,
+        compressed.compressed_quality_chunk_sizes,
+        compressed.quality_scores.original_size);
+  } else {
+    const auto resolved_bsc = resolve_bsc_config(
+        bsc_config, compressed.compressed_quality_chunk_sizes.size());
+    std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
+              << ", jobs: " << resolved_bsc.parallelism
+              << ", chunks: " << compressed.compressed_quality_chunk_sizes.size()
+              << std::endl;
+    quality_scores = bsc_decompress_chunked(
+        compressed.quality_scores.payload,
+        compressed.compressed_quality_chunk_sizes,
+        compressed.uncompressed_quality_chunk_sizes,
+        compressed.quality_scores.original_size, bsc_config);
+  }
   std::vector<uint8_t> reordered_quality_scores;
   const std::vector<uint8_t> *quality_scores_for_rebuild = &quality_scores;
   if (compressed.quality_layout == QualityLayoutKind::FixedLength &&

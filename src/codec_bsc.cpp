@@ -134,6 +134,16 @@ std::string_view bsc_backend_name(BscBackend backend) {
   return "unknown";
 }
 
+std::string_view quality_codec_name(QualityCodec codec) {
+  switch (codec) {
+  case QualityCodec::Bsc:
+    return "bsc";
+  case QualityCodec::Zstd:
+    return "zstd";
+  }
+  return "unknown";
+}
+
 ResolvedBscConfig resolve_bsc_config(const BscConfig &config, size_t task_count) {
   const BscBackend backend = resolve_backend(config.backend);
   return ResolvedBscConfig{
