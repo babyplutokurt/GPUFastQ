@@ -6,7 +6,9 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
 #include <cctype>
@@ -52,10 +54,23 @@ struct IdentifierColumnBuffers {
   std::vector<int32_t> int_values;
 };
 
+struct DeviceIdentifierSchema {
+  uint8_t *separator_bytes = nullptr;
+  uint64_t *separator_offsets = nullptr;
+  size_t separator_count = 0;
+  size_t column_count = 0;
+};
+
 std::vector<uint8_t>
 gpu_decompress_chunked(const std::vector<uint8_t> &compressed,
                        const std::vector<uint64_t> &chunk_sizes,
                        uint64_t expected_size);
+
+ChunkedCompressedBuffer gpu_compress_device_chunked(const uint8_t *d_input,
+                                                    size_t input_size,
+                                                    size_t field_slice_size,
+                                                    size_t nvcomp_chunk_size,
+                                                    cudaStream_t stream);
 
 struct DeviceFieldBuffers {
   uint8_t *identifiers = nullptr;
@@ -68,6 +83,12 @@ struct EncodedBasecallBuffers {
   uint32_t *n_counts = nullptr;
   uint64_t *n_offsets = nullptr;
   uint16_t *n_positions = nullptr;
+};
+
+struct UInt32ToUInt64 {
+  __host__ __device__ uint64_t operator()(uint32_t value) const {
+    return static_cast<uint64_t>(value);
+  }
 };
 
 std::vector<uint8_t>
@@ -288,12 +309,12 @@ std::vector<int32_t> delta_decode_int32(const int32_t *values, size_t count) {
   return decoded;
 }
 
-uint32_t zigzag_encode_int32(int32_t value) {
+__host__ __device__ uint32_t zigzag_encode_int32(int32_t value) {
   return (static_cast<uint32_t>(value) << 1) ^
          static_cast<uint32_t>(value >> 31);
 }
 
-int32_t zigzag_decode_int32(uint32_t value) {
+__host__ __device__ int32_t zigzag_decode_int32(uint32_t value) {
   return static_cast<int32_t>((value >> 1) ^
                               static_cast<uint32_t>(-static_cast<int32_t>(value & 1)));
 }
@@ -346,6 +367,314 @@ template <typename T> void cuda_free_if_set(T *ptr) {
   if (ptr != nullptr) {
     cudaFree(ptr);
   }
+}
+
+void free_device_identifier_schema(DeviceIdentifierSchema *schema) {
+  if (schema == nullptr) {
+    return;
+  }
+  cuda_free_if_set(schema->separator_bytes);
+  cuda_free_if_set(schema->separator_offsets);
+  schema->separator_count = 0;
+  schema->column_count = 0;
+}
+
+DeviceIdentifierSchema
+copy_identifier_schema_to_device(const IdentifierLayout &layout,
+                                 cudaStream_t stream) {
+  DeviceIdentifierSchema schema;
+  schema.separator_count = layout.separators.size();
+  schema.column_count = layout.column_kinds.size();
+
+  std::vector<uint64_t> separator_offsets(schema.separator_count + 1, 0);
+  std::vector<uint8_t> separator_bytes;
+  for (size_t i = 0; i < layout.separators.size(); ++i) {
+    separator_offsets[i] = separator_bytes.size();
+    separator_bytes.insert(separator_bytes.end(), layout.separators[i].begin(),
+                           layout.separators[i].end());
+  }
+  separator_offsets[schema.separator_count] = separator_bytes.size();
+
+  if (!separator_bytes.empty()) {
+    CUDA_CHECK(cudaMalloc(&schema.separator_bytes, separator_bytes.size()));
+    CUDA_CHECK(cudaMemcpyAsync(schema.separator_bytes, separator_bytes.data(),
+                               separator_bytes.size(), cudaMemcpyHostToDevice,
+                               stream));
+  }
+
+  CUDA_CHECK(cudaMalloc(&schema.separator_offsets,
+                        separator_offsets.size() * sizeof(uint64_t)));
+  CUDA_CHECK(cudaMemcpyAsync(schema.separator_offsets, separator_offsets.data(),
+                             separator_offsets.size() * sizeof(uint64_t),
+                             cudaMemcpyHostToDevice, stream));
+
+  return schema;
+}
+
+__device__ inline bool device_is_identifier_separator(uint8_t ch) {
+  return ch == ':' || ch == '/' || ch == '-' || ch == '.' ||
+         ch == ' ' || ch == '\t' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+
+__device__ bool advance_identifier_separator(const uint8_t *raw_bytes,
+                                             uint64_t pos,
+                                             uint64_t line_end,
+                                             const uint8_t *separator_bytes,
+                                             const uint64_t *separator_offsets,
+                                             uint32_t separator_index,
+                                             uint64_t *next_pos) {
+  const uint64_t start = separator_offsets[separator_index];
+  const uint64_t end = separator_offsets[separator_index + 1];
+  const uint64_t length = end - start;
+  if (pos + length > line_end) {
+    return false;
+  }
+  for (uint64_t i = 0; i < length; ++i) {
+    if (raw_bytes[pos + i] != separator_bytes[start + i]) {
+      return false;
+    }
+  }
+  *next_pos = pos + length;
+  return true;
+}
+
+__device__ bool locate_identifier_token(
+    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t record,
+    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
+    const uint64_t *separator_offsets, uint64_t *token_start,
+    uint32_t *token_length) {
+  const uint64_t id_line = 4 * record;
+  uint64_t pos = line_offsets[id_line] + 1;
+  const uint64_t line_end = line_offsets[id_line + 1] - 1;
+  if (pos >= line_end) {
+    return false;
+  }
+
+  for (uint32_t column = 0; column <= target_column; ++column) {
+    const uint64_t current_start = pos;
+    while (pos < line_end && !device_is_identifier_separator(raw_bytes[pos])) {
+      ++pos;
+    }
+    if (pos == current_start) {
+      return false;
+    }
+
+    if (column == target_column) {
+      *token_start = current_start;
+      *token_length = static_cast<uint32_t>(pos - current_start);
+      if (column + 1 == column_count) {
+        return pos == line_end;
+      }
+      uint64_t next_pos = 0;
+      return advance_identifier_separator(raw_bytes, pos, line_end,
+                                          separator_bytes, separator_offsets,
+                                          column, &next_pos);
+    }
+
+    if (column >= column_count - 1) {
+      return false;
+    }
+    uint64_t next_pos = 0;
+    if (!advance_identifier_separator(raw_bytes, pos, line_end, separator_bytes,
+                                      separator_offsets, column, &next_pos)) {
+      return false;
+    }
+    pos = next_pos;
+  }
+
+  return false;
+}
+
+__device__ bool parse_identifier_int32_device(const uint8_t *raw_bytes,
+                                              uint64_t token_start,
+                                              uint32_t token_length,
+                                              int32_t *value_out) {
+  constexpr int64_t kInt32Min = -2147483648ll;
+  constexpr int64_t kInt32Max = 2147483647ll;
+  if (token_length == 0) {
+    return false;
+  }
+
+  uint32_t index = 0;
+  bool negative = false;
+  if (raw_bytes[token_start] == '+') {
+    return false;
+  }
+  if (raw_bytes[token_start] == '-') {
+    negative = true;
+    index = 1;
+    if (token_length == 1) {
+      return false;
+    }
+  }
+
+  const uint8_t first_digit = raw_bytes[token_start + index];
+  if (first_digit < '0' || first_digit > '9') {
+    return false;
+  }
+  const uint32_t digit_count = token_length - index;
+  if (digit_count > 1 && first_digit == '0') {
+    return false;
+  }
+
+  const int64_t limit =
+      negative ? (kInt32Max + 1) : kInt32Max;
+  int64_t value = 0;
+  for (; index < token_length; ++index) {
+    const uint8_t ch = raw_bytes[token_start + index];
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    value = value * 10 + static_cast<int64_t>(ch - '0');
+    if (value > limit) {
+      return false;
+    }
+  }
+
+  if (negative) {
+    if (value == 0) {
+      return false;
+    }
+    value = -value;
+  }
+
+  if (value < kInt32Min || value > kInt32Max) {
+    return false;
+  }
+
+  *value_out = static_cast<int32_t>(value);
+  return true;
+}
+
+__global__ void extract_identifier_string_lengths_kernel(
+    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
+    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
+    const uint64_t *separator_offsets, uint32_t *lengths,
+    unsigned long long *invalid_record) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_records) {
+    return;
+  }
+
+  uint64_t token_start = 0;
+  uint32_t token_length = 0;
+  if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
+                               column_count, separator_bytes,
+                               separator_offsets, &token_start,
+                               &token_length)) {
+    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
+    return;
+  }
+  lengths[idx] = token_length;
+}
+
+__global__ void scatter_identifier_string_values_kernel(
+    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
+    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
+    const uint64_t *separator_offsets, const uint64_t *value_offsets,
+    const uint32_t *lengths, uint8_t *values, unsigned long long *invalid_record) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_records) {
+    return;
+  }
+
+  uint64_t token_start = 0;
+  uint32_t token_length = 0;
+  if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
+                               column_count, separator_bytes,
+                               separator_offsets, &token_start,
+                               &token_length) ||
+      token_length != lengths[idx]) {
+    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
+    return;
+  }
+
+  const uint64_t dst = value_offsets[idx];
+  for (uint32_t i = 0; i < token_length; ++i) {
+    values[dst + i] = raw_bytes[token_start + i];
+  }
+}
+
+__global__ void extract_identifier_int32_values_kernel(
+    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
+    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
+    const uint64_t *separator_offsets, uint32_t *token_lengths,
+    int32_t *values, unsigned long long *invalid_record) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_records) {
+    return;
+  }
+
+  uint64_t token_start = 0;
+  uint32_t token_length = 0;
+  if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
+                               column_count, separator_bytes,
+                               separator_offsets, &token_start,
+                               &token_length)) {
+    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
+    return;
+  }
+
+  int32_t parsed_value = 0;
+  if (!parse_identifier_int32_device(raw_bytes, token_start, token_length,
+                                     &parsed_value)) {
+    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
+    return;
+  }
+
+  token_lengths[idx] = token_length;
+  values[idx] = parsed_value;
+}
+
+__global__ void delta_encode_int32_kernel(const int32_t *values, int32_t *deltas,
+                                          uint64_t count) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+  if (idx == 0) {
+    deltas[idx] = values[idx];
+    return;
+  }
+  deltas[idx] = values[idx] - values[idx - 1];
+}
+
+__device__ inline uint32_t identifier_varint_size(int32_t value) {
+  uint32_t encoded = zigzag_encode_int32(value);
+  uint32_t size = 1;
+  while (encoded >= 0x80u) {
+    encoded >>= 7;
+    ++size;
+  }
+  return size;
+}
+
+__global__ void compute_identifier_varint_sizes_kernel(const int32_t *values,
+                                                       uint64_t count,
+                                                       uint32_t *sizes) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+  sizes[idx] = identifier_varint_size(values[idx]);
+}
+
+__global__ void scatter_identifier_varints_kernel(const int32_t *values,
+                                                  const uint64_t *offsets,
+                                                  uint64_t count,
+                                                  uint8_t *output) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+
+  uint64_t dst = offsets[idx];
+  uint32_t encoded = zigzag_encode_int32(values[idx]);
+  while (encoded >= 0x80u) {
+    output[dst++] = static_cast<uint8_t>(encoded) | 0x80u;
+    encoded >>= 7;
+  }
+  output[dst] = static_cast<uint8_t>(encoded);
 }
 
 ChunkedCompressedBuffer host_compress_chunked(const std::vector<uint8_t> &input,
@@ -407,52 +736,12 @@ CompressedIdentifierData compress_identifiers_flat(const FastqData &data,
 }
 
 CompressedIdentifierData compress_identifiers_columnar(
-    const FastqData &data, size_t field_slice_size, size_t nvcomp_chunk_size) {
+    const FastqData &data, const uint8_t *d_raw_bytes,
+    const uint64_t *d_line_offsets, size_t field_slice_size,
+    size_t nvcomp_chunk_size, cudaStream_t stream) {
   if (!data.identifier_layout.columnar ||
       data.identifier_layout.column_kinds.empty()) {
     return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
-  }
-
-  std::vector<IdentifierColumnBuffers> columns(
-      data.identifier_layout.column_kinds.size());
-  for (size_t i = 0; i < columns.size(); ++i) {
-    columns[i].kind = data.identifier_layout.column_kinds[i];
-    if (columns[i].kind == IdentifierColumnKind::String) {
-      columns[i].string_lengths.reserve(static_cast<size_t>(data.num_records));
-    } else {
-      columns[i].int_values.reserve(static_cast<size_t>(data.num_records));
-    }
-  }
-
-  for (uint64_t record = 0; record < data.num_records; ++record) {
-    const uint64_t id_line = 4 * record;
-    const uint64_t id_len = line_content_length(data.line_offsets, id_line);
-    const uint64_t id_start = data.line_offsets[id_line] + 1;
-    auto tokenized = tokenize_identifier(data.raw_bytes.data() + id_start,
-                                         static_cast<size_t>(id_len - 1));
-    if (tokenized.tokens.size() != data.identifier_layout.column_kinds.size() ||
-        tokenized.separators != data.identifier_layout.separators) {
-      return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
-    }
-
-    for (size_t i = 0; i < columns.size(); ++i) {
-      if (columns[i].kind == IdentifierColumnKind::String) {
-        const auto &token = tokenized.tokens[i];
-        if (token.size() > std::numeric_limits<uint32_t>::max()) {
-          throw std::runtime_error("Identifier token length exceeds uint32_t");
-        }
-        columns[i].raw_text_size += token.size();
-        columns[i].string_lengths.push_back(static_cast<uint32_t>(token.size()));
-        columns[i].string_values.insert(columns[i].string_values.end(),
-                                        token.begin(), token.end());
-      } else {
-        if (!token_is_int32(tokenized.tokens[i])) {
-          return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
-        }
-        columns[i].raw_text_size += tokenized.tokens[i].size();
-        columns[i].int_values.push_back(parse_int32_token(tokenized.tokens[i]));
-      }
-    }
   }
 
   CompressedIdentifierData result;
@@ -460,70 +749,239 @@ CompressedIdentifierData compress_identifiers_columnar(
   result.original_size = compute_field_stats(data).identifiers_size;
   result.layout = data.identifier_layout;
   result.layout.columnar = true;
-  result.columns.resize(columns.size());
-
-  for (size_t i = 0; i < columns.size(); ++i) {
-    auto &out = result.columns[i];
-    out.kind = columns[i].kind;
-    out.raw_text_size = columns[i].raw_text_size;
-    if (out.kind == IdentifierColumnKind::String) {
-      out.encoding = IdentifierColumnEncoding::Plain;
-      out.values.original_size = columns[i].string_values.size();
-      auto value_chunks = host_compress_chunked(columns[i].string_values,
-                                                field_slice_size,
-                                                nvcomp_chunk_size);
-      out.values.payload = std::move(value_chunks.data);
-      out.compressed_value_chunk_sizes = std::move(value_chunks.chunk_sizes);
-
-      std::vector<uint8_t> length_bytes(columns[i].string_lengths.size() *
-                                        sizeof(uint32_t));
-      if (!columns[i].string_lengths.empty()) {
-        std::memcpy(length_bytes.data(), columns[i].string_lengths.data(),
-                    length_bytes.size());
-      }
-      out.lengths.original_size = length_bytes.size();
-      auto length_chunks =
-          host_compress_chunked(length_bytes, field_slice_size, nvcomp_chunk_size);
-      out.lengths.payload = std::move(length_chunks.data);
-      out.compressed_length_chunk_sizes = std::move(length_chunks.chunk_sizes);
-    } else {
-      const auto plain_bytes = int32_vector_to_bytes(columns[i].int_values);
-      const auto delta_values = delta_encode_int32(columns[i].int_values);
-      const auto delta_bytes = int32_vector_to_bytes(delta_values);
-      const auto delta_varint_bytes = encode_varint_u32(delta_values);
-
-      auto plain_chunks =
-          host_compress_chunked(plain_bytes, field_slice_size, nvcomp_chunk_size);
-      auto delta_chunks =
-          host_compress_chunked(delta_bytes, field_slice_size, nvcomp_chunk_size);
-      auto delta_varint_chunks = host_compress_chunked(
-          delta_varint_bytes, field_slice_size, nvcomp_chunk_size);
-
-      const uint64_t plain_size = sum_sizes(plain_chunks.chunk_sizes);
-      const uint64_t delta_size = sum_sizes(delta_chunks.chunk_sizes);
-      const uint64_t delta_varint_size =
-          sum_sizes(delta_varint_chunks.chunk_sizes);
-
-      if (delta_varint_size < delta_size && delta_varint_size < plain_size) {
-        out.encoding = IdentifierColumnEncoding::DeltaVarint;
-        out.values.original_size = delta_varint_bytes.size();
-        out.values.payload = std::move(delta_varint_chunks.data);
-        out.compressed_value_chunk_sizes =
-            std::move(delta_varint_chunks.chunk_sizes);
-      } else if (delta_size < plain_size) {
-        out.encoding = IdentifierColumnEncoding::Delta;
-        out.values.original_size = plain_bytes.size();
-        out.values.payload = std::move(delta_chunks.data);
-        out.compressed_value_chunk_sizes = std::move(delta_chunks.chunk_sizes);
-      } else {
-        out.encoding = IdentifierColumnEncoding::Plain;
-        out.values.original_size = plain_bytes.size();
-        out.values.payload = std::move(plain_chunks.data);
-        out.compressed_value_chunk_sizes = std::move(plain_chunks.chunk_sizes);
-      }
+  result.columns.resize(data.identifier_layout.column_kinds.size());
+  if (data.num_records == 0) {
+    for (size_t i = 0; i < result.columns.size(); ++i) {
+      result.columns[i].kind = data.identifier_layout.column_kinds[i];
     }
+    return result;
   }
 
+  DeviceIdentifierSchema schema;
+  uint32_t *d_lengths = nullptr;
+  uint64_t *d_offsets = nullptr;
+  int32_t *d_int_values = nullptr;
+  int32_t *d_delta_values = nullptr;
+  uint32_t *d_varint_sizes = nullptr;
+  uint64_t *d_varint_offsets = nullptr;
+  uint8_t *d_string_values = nullptr;
+  uint8_t *d_varint_bytes = nullptr;
+  unsigned long long *d_invalid_record = nullptr;
+  bool fallback_to_flat = false;
+  const uint32_t block_size = 256;
+  const uint32_t grid_size = static_cast<uint32_t>(
+      (data.num_records + block_size - 1) / block_size);
+
+  try {
+    schema = copy_identifier_schema_to_device(data.identifier_layout, stream);
+    if (data.num_records > 0) {
+      CUDA_CHECK(cudaMalloc(&d_lengths, data.num_records * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_offsets, data.num_records * sizeof(uint64_t)));
+      CUDA_CHECK(cudaMalloc(&d_int_values, data.num_records * sizeof(int32_t)));
+      CUDA_CHECK(cudaMalloc(&d_delta_values, data.num_records * sizeof(int32_t)));
+      CUDA_CHECK(cudaMalloc(&d_varint_sizes, data.num_records * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_varint_offsets, data.num_records * sizeof(uint64_t)));
+      CUDA_CHECK(cudaMalloc(&d_invalid_record, sizeof(unsigned long long)));
+    }
+
+    for (size_t i = 0; i < result.columns.size(); ++i) {
+      auto &out = result.columns[i];
+      out.kind = data.identifier_layout.column_kinds[i];
+      out.encoding = IdentifierColumnEncoding::Plain;
+      d_string_values = nullptr;
+      d_varint_bytes = nullptr;
+
+      unsigned long long invalid_record =
+          std::numeric_limits<unsigned long long>::max();
+      if (data.num_records > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(d_invalid_record, &invalid_record,
+                                   sizeof(unsigned long long),
+                                   cudaMemcpyHostToDevice, stream));
+      }
+
+      if (out.kind == IdentifierColumnKind::String) {
+        extract_identifier_string_lengths_kernel<<<grid_size, block_size, 0,
+                                                  stream>>>(
+            d_raw_bytes, d_line_offsets, data.num_records,
+            static_cast<uint32_t>(i),
+            static_cast<uint32_t>(result.columns.size()),
+            schema.separator_bytes, schema.separator_offsets, d_lengths,
+            d_invalid_record);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(&invalid_record, d_invalid_record,
+                              sizeof(unsigned long long),
+                              cudaMemcpyDeviceToHost));
+        if (invalid_record != std::numeric_limits<unsigned long long>::max()) {
+          fallback_to_flat = true;
+          break;
+        }
+
+        auto length_begin = thrust::make_transform_iterator(
+            thrust::device_pointer_cast(d_lengths), UInt32ToUInt64{});
+        out.raw_text_size = thrust::reduce(
+            thrust::cuda::par.on(stream), length_begin,
+            length_begin + data.num_records, uint64_t{0},
+            thrust::plus<uint64_t>());
+
+        if (out.raw_text_size > 0) {
+          thrust::exclusive_scan(thrust::cuda::par.on(stream), length_begin,
+                                 length_begin + data.num_records,
+                                 thrust::device_pointer_cast(d_offsets));
+
+          CUDA_CHECK(cudaMalloc(&d_string_values, out.raw_text_size));
+          scatter_identifier_string_values_kernel<<<grid_size, block_size, 0,
+                                                   stream>>>(
+              d_raw_bytes, d_line_offsets, data.num_records,
+              static_cast<uint32_t>(i),
+              static_cast<uint32_t>(result.columns.size()),
+              schema.separator_bytes, schema.separator_offsets, d_offsets,
+              d_lengths, d_string_values, d_invalid_record);
+          CUDA_CHECK(cudaGetLastError());
+          CUDA_CHECK(cudaStreamSynchronize(stream));
+          CUDA_CHECK(cudaMemcpy(&invalid_record, d_invalid_record,
+                                sizeof(unsigned long long),
+                                cudaMemcpyDeviceToHost));
+          if (invalid_record != std::numeric_limits<unsigned long long>::max()) {
+            fallback_to_flat = true;
+            break;
+          }
+        }
+
+        out.values.original_size = out.raw_text_size;
+        auto value_chunks = gpu_compress_device_chunked(
+            d_string_values, out.raw_text_size, field_slice_size,
+            nvcomp_chunk_size, stream);
+        out.values.payload = std::move(value_chunks.data);
+        out.compressed_value_chunk_sizes = std::move(value_chunks.chunk_sizes);
+        out.lengths.original_size = data.num_records * sizeof(uint32_t);
+        auto length_chunks = gpu_compress_device_chunked(
+            reinterpret_cast<const uint8_t *>(d_lengths),
+            out.lengths.original_size, field_slice_size, nvcomp_chunk_size,
+            stream);
+        out.lengths.payload = std::move(length_chunks.data);
+        out.compressed_length_chunk_sizes = std::move(length_chunks.chunk_sizes);
+      } else {
+        extract_identifier_int32_values_kernel<<<grid_size, block_size, 0,
+                                                stream>>>(
+            d_raw_bytes, d_line_offsets, data.num_records,
+            static_cast<uint32_t>(i),
+            static_cast<uint32_t>(result.columns.size()),
+            schema.separator_bytes, schema.separator_offsets, d_lengths,
+            d_int_values, d_invalid_record);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(&invalid_record, d_invalid_record,
+                              sizeof(unsigned long long),
+                              cudaMemcpyDeviceToHost));
+        if (invalid_record != std::numeric_limits<unsigned long long>::max()) {
+          fallback_to_flat = true;
+          break;
+        }
+
+        auto length_begin = thrust::make_transform_iterator(
+            thrust::device_pointer_cast(d_lengths), UInt32ToUInt64{});
+        out.raw_text_size = thrust::reduce(
+            thrust::cuda::par.on(stream), length_begin,
+            length_begin + data.num_records, uint64_t{0},
+            thrust::plus<uint64_t>());
+
+        const uint64_t plain_size = data.num_records * sizeof(int32_t);
+        auto plain_chunks = gpu_compress_device_chunked(
+            reinterpret_cast<const uint8_t *>(d_int_values), plain_size,
+            field_slice_size, nvcomp_chunk_size, stream);
+
+        delta_encode_int32_kernel<<<grid_size, block_size, 0, stream>>>(
+            d_int_values, d_delta_values, data.num_records);
+        CUDA_CHECK(cudaGetLastError());
+        auto delta_chunks = gpu_compress_device_chunked(
+            reinterpret_cast<const uint8_t *>(d_delta_values), plain_size,
+            field_slice_size, nvcomp_chunk_size, stream);
+
+        compute_identifier_varint_sizes_kernel<<<grid_size, block_size, 0,
+                                                stream>>>(
+            d_delta_values, data.num_records, d_varint_sizes);
+        CUDA_CHECK(cudaGetLastError());
+        auto varint_begin = thrust::make_transform_iterator(
+            thrust::device_pointer_cast(d_varint_sizes), UInt32ToUInt64{});
+        thrust::exclusive_scan(thrust::cuda::par.on(stream), varint_begin,
+                               varint_begin + data.num_records,
+                               thrust::device_pointer_cast(d_varint_offsets));
+        const uint64_t delta_varint_size = thrust::reduce(
+            thrust::cuda::par.on(stream),
+            thrust::device_pointer_cast(d_varint_sizes),
+            thrust::device_pointer_cast(d_varint_sizes) + data.num_records,
+            uint64_t{0}, thrust::plus<uint64_t>());
+        if (delta_varint_size > 0) {
+          CUDA_CHECK(cudaMalloc(&d_varint_bytes, delta_varint_size));
+          scatter_identifier_varints_kernel<<<grid_size, block_size, 0,
+                                             stream>>>(
+              d_delta_values, d_varint_offsets, data.num_records,
+              d_varint_bytes);
+          CUDA_CHECK(cudaGetLastError());
+        }
+        auto delta_varint_chunks = gpu_compress_device_chunked(
+            d_varint_bytes, delta_varint_size, field_slice_size,
+            nvcomp_chunk_size, stream);
+
+        const uint64_t plain_comp_size = sum_sizes(plain_chunks.chunk_sizes);
+        const uint64_t delta_comp_size = sum_sizes(delta_chunks.chunk_sizes);
+        const uint64_t delta_varint_comp_size =
+            sum_sizes(delta_varint_chunks.chunk_sizes);
+
+        if (delta_varint_comp_size < delta_comp_size &&
+            delta_varint_comp_size < plain_comp_size) {
+          out.encoding = IdentifierColumnEncoding::DeltaVarint;
+          out.values.original_size = delta_varint_size;
+          out.values.payload = std::move(delta_varint_chunks.data);
+          out.compressed_value_chunk_sizes =
+              std::move(delta_varint_chunks.chunk_sizes);
+        } else if (delta_comp_size < plain_comp_size) {
+          out.encoding = IdentifierColumnEncoding::Delta;
+          out.values.original_size = plain_size;
+          out.values.payload = std::move(delta_chunks.data);
+          out.compressed_value_chunk_sizes = std::move(delta_chunks.chunk_sizes);
+        } else {
+          out.encoding = IdentifierColumnEncoding::Plain;
+          out.values.original_size = plain_size;
+          out.values.payload = std::move(plain_chunks.data);
+          out.compressed_value_chunk_sizes = std::move(plain_chunks.chunk_sizes);
+        }
+      }
+
+      cuda_free_if_set(d_string_values);
+      cuda_free_if_set(d_varint_bytes);
+      d_string_values = nullptr;
+      d_varint_bytes = nullptr;
+      if (fallback_to_flat) {
+        break;
+      }
+    }
+  } catch (...) {
+    cuda_free_if_set(d_string_values);
+    cuda_free_if_set(d_varint_bytes);
+    cuda_free_if_set(d_lengths);
+    cuda_free_if_set(d_offsets);
+    cuda_free_if_set(d_int_values);
+    cuda_free_if_set(d_delta_values);
+    cuda_free_if_set(d_varint_sizes);
+    cuda_free_if_set(d_varint_offsets);
+    cuda_free_if_set(d_invalid_record);
+    free_device_identifier_schema(&schema);
+    throw;
+  }
+
+  cuda_free_if_set(d_lengths);
+  cuda_free_if_set(d_offsets);
+  cuda_free_if_set(d_int_values);
+  cuda_free_if_set(d_delta_values);
+  cuda_free_if_set(d_varint_sizes);
+  cuda_free_if_set(d_varint_offsets);
+  cuda_free_if_set(d_invalid_record);
+  free_device_identifier_schema(&schema);
+  if (fallback_to_flat) {
+    return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
+  }
   return result;
 }
 
@@ -1255,11 +1713,10 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
   result.num_records = data.num_records;
   result.identifiers.original_size = stats.identifiers_size;
   result.quality_scores.original_size = stats.quality_scores_size;
-  result.quality_layout = data.quality_layout;
-  result.fixed_quality_length =
-      data.quality_layout == QualityLayoutKind::FixedLength
-          ? data.fixed_quality_length
-          : 0;
+  // Deprecated for now: keep fixed/variable detection in FastqData, but store
+  // quality scores in the original row-major layout for all files.
+  result.quality_layout = QualityLayoutKind::VariableLength;
+  result.fixed_quality_length = 0;
   result.line_lengths.original_size = stats.line_length_size;
   result.line_offset_count = data.line_offsets.size();
   const bool use_columnar_identifiers = data.identifier_layout.columnar;
@@ -1364,8 +1821,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "Compressing identifiers (" << stats.identifiers_size
               << " bytes)..." << std::endl;
     if (use_columnar_identifiers) {
-      result.identifiers = compress_identifiers_columnar(data, field_slice_size,
-                                                         chunk_size);
+      result.identifiers =
+          compress_identifiers_columnar(data, d_raw_bytes, d_line_offsets,
+                                        field_slice_size, chunk_size, stream);
       uint64_t compressed_identifier_size = result.identifiers.flat_data.payload.size();
       for (const auto &column : result.identifiers.columns) {
         compressed_identifier_size += column.values.payload.size();
@@ -1466,19 +1924,14 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    std::vector<uint8_t> quality_payload_for_compression;
-    const uint8_t *quality_input = h_quality_scores.data();
     if (data.quality_layout == QualityLayoutKind::FixedLength &&
         data.fixed_quality_length != 0) {
-      quality_payload_for_compression = transpose_fixed_length_quality_scores(
-          h_quality_scores, data.num_records, data.fixed_quality_length);
-      quality_input = quality_payload_for_compression.data();
-      std::cerr << "  Layout: column-major fixed-length ("
-                << data.fixed_quality_length << " bases)" << std::endl;
+      std::cerr << "  Layout: row-major fixed-length (column-major disabled)"
+                << std::endl;
     } else {
       std::cerr << "  Layout: row-major variable-length" << std::endl;
     }
-    auto qual_chunks = bsc_compress_chunked(quality_input,
+    auto qual_chunks = bsc_compress_chunked(h_quality_scores.data(),
                                             stats.quality_scores_size,
                                             BSC_QUALITY_CHUNK_SIZE,
                                             bsc_config);
