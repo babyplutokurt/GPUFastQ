@@ -26,6 +26,7 @@ struct BscConfig {
   size_t threads = 0;
   size_t gpu_jobs = 0;
   bool zstd_transpose_quality = false;
+  bool stat_mode = false;
 };
 
 struct ResolvedBscConfig {

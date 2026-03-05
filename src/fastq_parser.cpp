@@ -2,7 +2,9 @@
 #include "gpufastq/codec_gpu.cuh"
 
 #include <cctype>
+#include <chrono>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -109,7 +111,8 @@ IdentifierLayout discover_identifier_layout(const FastqData &data) {
   const uint64_t first_start = data.line_offsets[0] + 1;
   auto reference =
       tokenize_identifier(data.raw_bytes.data() + first_start, first_len - 1);
-  if (reference.tokens.empty() || reference.separators.size() + 1 != reference.tokens.size()) {
+  if (reference.tokens.empty() ||
+      reference.separators.size() + 1 != reference.tokens.size()) {
     return layout;
   }
 
@@ -142,7 +145,7 @@ IdentifierLayout discover_identifier_layout(const FastqData &data) {
   layout.column_kinds.reserve(reference.tokens.size());
   for (bool is_numeric : numeric) {
     layout.column_kinds.push_back(is_numeric ? IdentifierColumnKind::Int32
-                                            : IdentifierColumnKind::String);
+                                             : IdentifierColumnKind::String);
   }
   return layout;
 }
@@ -173,15 +176,18 @@ void validate_fastq_layout(const FastqData &data) {
     throw std::runtime_error("FASTQ line index must start at byte offset 0");
   }
   if (data.line_offsets.back() != data.raw_bytes.size()) {
-    throw std::runtime_error("FASTQ line index sentinel is inconsistent with the file size");
+    throw std::runtime_error(
+        "FASTQ line index sentinel is inconsistent with the file size");
   }
 
   const uint64_t num_lines = data.line_offsets.size() - 1;
   if (num_lines % 4 != 0) {
-    throw std::runtime_error("FASTQ file does not contain a multiple of 4 lines");
+    throw std::runtime_error(
+        "FASTQ file does not contain a multiple of 4 lines");
   }
   if (data.num_records != num_lines / 4) {
-    throw std::runtime_error("FASTQ record count does not match the line index");
+    throw std::runtime_error(
+        "FASTQ record count does not match the line index");
   }
 
   for (uint64_t record = 0; record < data.num_records; ++record) {
@@ -222,10 +228,12 @@ void validate_fastq_layout(const FastqData &data) {
                                std::to_string(record + 1));
     }
     if (seq_start != id_start + id_len + 1) {
-      throw std::runtime_error("Identifier line length does not match line index");
+      throw std::runtime_error(
+          "Identifier line length does not match line index");
     }
     if (plus_start != seq_start + seq_len + 1) {
-      throw std::runtime_error("Sequence line length does not match line index");
+      throw std::runtime_error(
+          "Sequence line length does not match line index");
     }
     if (qual_start != plus_start + plus_len + 1) {
       throw std::runtime_error("Plus line length does not match line index");
@@ -235,7 +243,10 @@ void validate_fastq_layout(const FastqData &data) {
 
 } // namespace
 
-FastqData parse_fastq(const std::string &filepath) {
+FastqData parse_fastq(const std::string &filepath, bool stat_mode) {
+  using clock = std::chrono::high_resolution_clock;
+  const auto t0 = clock::now();
+
   std::ifstream file(filepath, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
     throw std::runtime_error("Cannot open FASTQ file: " + filepath);
@@ -263,16 +274,42 @@ FastqData parse_fastq(const std::string &filepath) {
     return data;
   }
 
+  const auto t1 = clock::now();
+
   data.line_offsets = build_line_offsets_gpu(data.raw_bytes);
   data.num_records = (data.line_offsets.size() - 1) / 4;
 
+  const auto t2 = clock::now();
+
   validate_fastq_layout(data);
+
+  const auto t3 = clock::now();
+
   const auto quality_analysis =
       analyze_quality_lengths(data.line_offsets, data.num_records);
   data.quality_lengths = quality_analysis.lengths;
   data.quality_layout = quality_analysis.layout;
   data.fixed_quality_length = quality_analysis.fixed_length;
+
+  const auto t4 = clock::now();
+
   data.identifier_layout = discover_identifier_layout(data);
+
+  const auto t5 = clock::now();
+
+  if (stat_mode) {
+    auto ms = [](const auto &start, const auto &end) {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+          .count();
+    };
+    std::cerr << "Parser stage timings:" << std::endl;
+    std::cerr << "  Read file:       " << ms(t0, t1) << " ms" << std::endl;
+    std::cerr << "  Indexing:        " << ms(t1, t2) << " ms" << std::endl;
+    std::cerr << "  Validate layout: " << ms(t2, t3) << " ms" << std::endl;
+    std::cerr << "  Analyze quality: " << ms(t3, t4) << " ms" << std::endl;
+    std::cerr << "  Discover schema: " << ms(t4, t5) << " ms" << std::endl;
+  }
+
   return data;
 }
 
@@ -282,7 +319,8 @@ FastqFieldStats compute_field_stats(const FastqData &data) {
   FastqFieldStats stats;
   if (!data.line_offsets.empty()) {
     for (size_t i = 0; i + 1 < data.line_offsets.size(); ++i) {
-      const uint64_t line_length = data.line_offsets[i + 1] - data.line_offsets[i];
+      const uint64_t line_length =
+          data.line_offsets[i + 1] - data.line_offsets[i];
       if (line_length > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("FASTQ line length exceeds uint32_t range");
       }
@@ -293,7 +331,8 @@ FastqFieldStats compute_field_stats(const FastqData &data) {
     const uint64_t id_line = 4 * record;
     const uint64_t seq_line = id_line + 1;
 
-    stats.identifiers_size += line_content_length(data.line_offsets, id_line) - 1;
+    stats.identifiers_size +=
+        line_content_length(data.line_offsets, id_line) - 1;
     stats.basecalls_size += line_content_length(data.line_offsets, seq_line);
   }
 
@@ -304,7 +343,8 @@ FastqFieldStats compute_field_stats(const FastqData &data) {
   } else {
     for (uint64_t record = 0; record < data.num_records; ++record) {
       const uint64_t qual_line = 4 * record + 3;
-      stats.quality_scores_size += line_content_length(data.line_offsets, qual_line);
+      stats.quality_scores_size +=
+          line_content_length(data.line_offsets, qual_line);
     }
   }
 

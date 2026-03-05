@@ -39,7 +39,7 @@ int compress(const std::string &input_path, const std::string &output_path,
   const auto t0 = clock::now();
 
   std::cerr << "=== Parsing FASTQ: " << input_path << " ===\n";
-  const auto data = parse_fastq(input_path);
+  const auto data = parse_fastq(input_path, bsc_config.stat_mode);
   const auto stats = compute_field_stats(data);
   const auto t1 = clock::now();
 
@@ -68,8 +68,7 @@ int compress(const std::string &input_path, const std::string &output_path,
     std::cerr << "BSC backend:       " << bsc_backend_name(bsc_config.backend)
               << "\n";
   }
-  const auto compressed =
-      compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_config);
+  const auto compressed = compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_config);
   const auto t2 = clock::now();
 
   const size_t compressed_payload_size =
@@ -106,7 +105,7 @@ int compress(const std::string &input_path, const std::string &output_path,
 int roundtrip(const std::string &input_path, const BscConfig &bsc_config) {
   std::cerr << "=== Round-trip verification ===\n";
 
-  const auto original = parse_fastq(input_path);
+  const auto original = parse_fastq(input_path, bsc_config.stat_mode);
   std::cerr << "Parsed " << original.num_records << " records\n";
   std::cerr << "Quality layout: "
             << (original.quality_layout == QualityLayoutKind::FixedLength

@@ -57,7 +57,9 @@ void print_usage(const char *prog) {
       << "  --bsc-gpu-jobs N   Override concurrent chunk jobs for CUDA BSC "
          "mode\n"
       << "  --transpose        Transpose fixed-length quality scores before "
-         "Zstd compression\n\n"
+         "Zstd compression\n"
+      << "  --stat             Print detailed timing statistics for each "
+         "stage\n\n"
       << "Environment:\n"
       << "  GPUFASTQ_BSC_BACKEND  Default BSC backend when --bsc-backend is "
          "not set\n"
@@ -84,6 +86,10 @@ int main(int argc, char *argv[]) {
       const std::string arg = argv[argi];
       if (arg == "--transpose") {
         bsc_config.zstd_transpose_quality = true;
+        continue;
+      }
+      if (arg == "--stat") {
+        bsc_config.stat_mode = true;
         continue;
       }
       if (arg == "--quality-codec" || arg == "--bsc-backend" ||

@@ -2200,16 +2200,21 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                          Clock::now() - line_length_start)
                          .count();
     std::cerr << "  Time: " << line_length_ms << " ms" << std::endl;
-    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              Clock::now() - compression_start)
-                              .count();
-    std::cerr << "Compression stage timings:" << std::endl;
-    std::cerr << "  Field prep:      " << field_prep_ms << " ms" << std::endl;
-    std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
-    std::cerr << "  Basecalls:       " << basecall_ms << " ms" << std::endl;
-    std::cerr << "  Quality scores:  " << quality_ms << " ms" << std::endl;
-    std::cerr << "  Line lengths:    " << line_length_ms << " ms" << std::endl;
-    std::cerr << "  Total compress:  " << total_ms << " ms" << std::endl;
+
+    if (bsc_config.stat_mode) {
+      const auto total_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              Clock::now() - compression_start)
+              .count();
+      std::cerr << "Compression stage timings:" << std::endl;
+      std::cerr << "  Field prep:      " << field_prep_ms << " ms" << std::endl;
+      std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
+      std::cerr << "  Basecalls:       " << basecall_ms << " ms" << std::endl;
+      std::cerr << "  Quality scores:  " << quality_ms << " ms" << std::endl;
+      std::cerr << "  Line lengths:    " << line_length_ms << " ms"
+                << std::endl;
+      std::cerr << "  Total compress:  " << total_ms << " ms" << std::endl;
+    }
   } catch (...) {
     cuda_free_if_set(d_line_lengths);
     cuda_free_if_set(fields.identifiers);
