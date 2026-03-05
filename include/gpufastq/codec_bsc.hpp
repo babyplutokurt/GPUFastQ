@@ -25,6 +25,7 @@ struct BscConfig {
   BscBackend backend = BscBackend::Default;
   size_t threads = 0;
   size_t gpu_jobs = 0;
+  bool zstd_transpose_quality = false;
 };
 
 struct ResolvedBscConfig {

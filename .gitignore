@@ -9,3 +9,4 @@ build/
 .clangd
 *.fastq
 *.fq
+extern/

@@ -6,13 +6,13 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
-#include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -101,48 +101,47 @@ struct UInt32ToUInt64 {
   }
 };
 
-std::vector<uint8_t>
-transpose_fixed_length_quality_scores(const std::vector<uint8_t> &quality_scores,
-                                      uint64_t num_records,
-                                      uint32_t quality_length) {
+std::vector<uint8_t> transpose_fixed_length_quality_scores(
+    const std::vector<uint8_t> &quality_scores, uint64_t num_records,
+    uint32_t quality_length) {
   if (quality_scores.empty()) {
     return {};
   }
   if (num_records == 0 ||
-      quality_scores.size() != num_records * static_cast<uint64_t>(quality_length)) {
+      quality_scores.size() !=
+          num_records * static_cast<uint64_t>(quality_length)) {
     throw std::runtime_error(
         "Fixed-length quality transpose received inconsistent input size");
   }
 
   std::vector<uint8_t> transposed(quality_scores.size());
   for (uint32_t column = 0; column < quality_length; ++column) {
-    const uint64_t column_offset =
-        static_cast<uint64_t>(column) * num_records;
+    const uint64_t column_offset = static_cast<uint64_t>(column) * num_records;
     for (uint64_t record = 0; record < num_records; ++record) {
       transposed[column_offset + record] =
-          quality_scores[record * static_cast<uint64_t>(quality_length) + column];
+          quality_scores[record * static_cast<uint64_t>(quality_length) +
+                         column];
     }
   }
   return transposed;
 }
 
-std::vector<uint8_t>
-inverse_transpose_fixed_length_quality_scores(
+std::vector<uint8_t> inverse_transpose_fixed_length_quality_scores(
     const std::vector<uint8_t> &transposed_quality_scores, uint64_t num_records,
     uint32_t quality_length) {
   if (transposed_quality_scores.empty()) {
     return {};
   }
-  if (num_records == 0 || transposed_quality_scores.size() !=
-                              num_records * static_cast<uint64_t>(quality_length)) {
-    throw std::runtime_error(
-        "Fixed-length quality inverse transpose received inconsistent input size");
+  if (num_records == 0 ||
+      transposed_quality_scores.size() !=
+          num_records * static_cast<uint64_t>(quality_length)) {
+    throw std::runtime_error("Fixed-length quality inverse transpose received "
+                             "inconsistent input size");
   }
 
   std::vector<uint8_t> quality_scores(transposed_quality_scores.size());
   for (uint32_t column = 0; column < quality_length; ++column) {
-    const uint64_t column_offset =
-        static_cast<uint64_t>(column) * num_records;
+    const uint64_t column_offset = static_cast<uint64_t>(column) * num_records;
     for (uint64_t record = 0; record < num_records; ++record) {
       quality_scores[record * static_cast<uint64_t>(quality_length) + column] =
           transposed_quality_scores[column_offset + record];
@@ -285,8 +284,8 @@ std::vector<int32_t> delta_encode_int32(const std::vector<int32_t> &values) {
 
   deltas[0] = values[0];
   for (size_t i = 1; i < values.size(); ++i) {
-    const int64_t delta = static_cast<int64_t>(values[i]) -
-                          static_cast<int64_t>(values[i - 1]);
+    const int64_t delta =
+        static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]);
     if (delta < std::numeric_limits<int32_t>::min() ||
         delta > std::numeric_limits<int32_t>::max()) {
       throw std::runtime_error("Identifier delta exceeds int32 range");
@@ -325,8 +324,8 @@ __host__ __device__ uint32_t zigzag_encode_int32(int32_t value) {
 }
 
 __host__ __device__ int32_t zigzag_decode_int32(uint32_t value) {
-  return static_cast<int32_t>((value >> 1) ^
-                              static_cast<uint32_t>(-static_cast<int32_t>(value & 1)));
+  return static_cast<int32_t>(
+      (value >> 1) ^ static_cast<uint32_t>(-static_cast<int32_t>(value & 1)));
 }
 
 std::vector<uint8_t> encode_varint_u32(const std::vector<int32_t> &values) {
@@ -368,7 +367,8 @@ std::vector<int32_t> decode_varint_u32(const std::vector<uint8_t> &bytes,
     throw std::runtime_error("Identifier varint payload ended mid-value");
   }
   if (values.size() != expected_count) {
-    throw std::runtime_error("Identifier varint payload decoded an unexpected count");
+    throw std::runtime_error(
+        "Identifier varint payload decoded an unexpected count");
   }
   return values;
 }
@@ -422,13 +422,12 @@ copy_identifier_schema_to_device(const IdentifierLayout &layout,
 }
 
 __device__ inline bool device_is_identifier_separator(uint8_t ch) {
-  return ch == ':' || ch == '/' || ch == '-' || ch == '.' ||
-         ch == ' ' || ch == '\t' || ch == '\r' || ch == '\f' || ch == '\v';
+  return ch == ':' || ch == '/' || ch == '-' || ch == '.' || ch == ' ' ||
+         ch == '\t' || ch == '\r' || ch == '\f' || ch == '\v';
 }
 
 __device__ bool advance_identifier_separator(const uint8_t *raw_bytes,
-                                             uint64_t pos,
-                                             uint64_t line_end,
+                                             uint64_t pos, uint64_t line_end,
                                              const uint8_t *separator_bytes,
                                              const uint64_t *separator_offsets,
                                              uint32_t separator_index,
@@ -448,11 +447,12 @@ __device__ bool advance_identifier_separator(const uint8_t *raw_bytes,
   return true;
 }
 
-__device__ bool locate_identifier_token(
-    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t record,
-    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
-    const uint64_t *separator_offsets, uint64_t *token_start,
-    uint32_t *token_length) {
+__device__ bool
+locate_identifier_token(const uint8_t *raw_bytes, const uint64_t *line_offsets,
+                        uint64_t record, uint32_t target_column,
+                        uint32_t column_count, const uint8_t *separator_bytes,
+                        const uint64_t *separator_offsets,
+                        uint64_t *token_start, uint32_t *token_length) {
   const uint64_t id_line = 4 * record;
   uint64_t pos = line_offsets[id_line] + 1;
   const uint64_t line_end = line_offsets[id_line + 1] - 1;
@@ -527,8 +527,7 @@ __device__ bool parse_identifier_int32_device(const uint8_t *raw_bytes,
     return false;
   }
 
-  const int64_t limit =
-      negative ? (kInt32Max + 1) : kInt32Max;
+  const int64_t limit = negative ? (kInt32Max + 1) : kInt32Max;
   int64_t value = 0;
   for (; index < token_length; ++index) {
     const uint8_t ch = raw_bytes[token_start + index];
@@ -557,9 +556,31 @@ __device__ bool parse_identifier_int32_device(const uint8_t *raw_bytes,
 }
 
 __global__ void extract_identifier_string_lengths_kernel(
-    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
-    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
-    const uint64_t *separator_offsets, uint32_t *lengths,
+    const uint8_t *raw_bytes, const uint64_t *line_offsets,
+    uint64_t num_records, uint32_t target_column, uint32_t column_count,
+    const uint8_t *separator_bytes, const uint64_t *separator_offsets,
+    uint32_t *lengths, unsigned long long *invalid_record) {
+  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_records) {
+    return;
+  }
+
+  uint64_t token_start = 0;
+  uint32_t token_length = 0;
+  if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
+                               column_count, separator_bytes, separator_offsets,
+                               &token_start, &token_length)) {
+    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
+    return;
+  }
+  lengths[idx] = token_length;
+}
+
+__global__ void scatter_identifier_string_values_kernel(
+    const uint8_t *raw_bytes, const uint64_t *line_offsets,
+    uint64_t num_records, uint32_t target_column, uint32_t column_count,
+    const uint8_t *separator_bytes, const uint64_t *separator_offsets,
+    const uint64_t *value_offsets, const uint32_t *lengths, uint8_t *values,
     unsigned long long *invalid_record) {
   const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= num_records) {
@@ -569,31 +590,8 @@ __global__ void extract_identifier_string_lengths_kernel(
   uint64_t token_start = 0;
   uint32_t token_length = 0;
   if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
-                               column_count, separator_bytes,
-                               separator_offsets, &token_start,
-                               &token_length)) {
-    atomicMin(invalid_record, static_cast<unsigned long long>(idx));
-    return;
-  }
-  lengths[idx] = token_length;
-}
-
-__global__ void scatter_identifier_string_values_kernel(
-    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
-    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
-    const uint64_t *separator_offsets, const uint64_t *value_offsets,
-    const uint32_t *lengths, uint8_t *values, unsigned long long *invalid_record) {
-  const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= num_records) {
-    return;
-  }
-
-  uint64_t token_start = 0;
-  uint32_t token_length = 0;
-  if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
-                               column_count, separator_bytes,
-                               separator_offsets, &token_start,
-                               &token_length) ||
+                               column_count, separator_bytes, separator_offsets,
+                               &token_start, &token_length) ||
       token_length != lengths[idx]) {
     atomicMin(invalid_record, static_cast<unsigned long long>(idx));
     return;
@@ -606,10 +604,11 @@ __global__ void scatter_identifier_string_values_kernel(
 }
 
 __global__ void extract_identifier_int32_values_kernel(
-    const uint8_t *raw_bytes, const uint64_t *line_offsets, uint64_t num_records,
-    uint32_t target_column, uint32_t column_count, const uint8_t *separator_bytes,
-    const uint64_t *separator_offsets, uint32_t *token_lengths,
-    int32_t *values, unsigned long long *invalid_record) {
+    const uint8_t *raw_bytes, const uint64_t *line_offsets,
+    uint64_t num_records, uint32_t target_column, uint32_t column_count,
+    const uint8_t *separator_bytes, const uint64_t *separator_offsets,
+    uint32_t *token_lengths, int32_t *values,
+    unsigned long long *invalid_record) {
   const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= num_records) {
     return;
@@ -618,9 +617,8 @@ __global__ void extract_identifier_int32_values_kernel(
   uint64_t token_start = 0;
   uint32_t token_length = 0;
   if (!locate_identifier_token(raw_bytes, line_offsets, idx, target_column,
-                               column_count, separator_bytes,
-                               separator_offsets, &token_start,
-                               &token_length)) {
+                               column_count, separator_bytes, separator_offsets,
+                               &token_start, &token_length)) {
     atomicMin(invalid_record, static_cast<unsigned long long>(idx));
     return;
   }
@@ -636,8 +634,8 @@ __global__ void extract_identifier_int32_values_kernel(
   values[idx] = parsed_value;
 }
 
-__global__ void delta_encode_int32_kernel(const int32_t *values, int32_t *deltas,
-                                          uint64_t count) {
+__global__ void delta_encode_int32_kernel(const int32_t *values,
+                                          int32_t *deltas, uint64_t count) {
   const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= count) {
     return;
@@ -745,10 +743,11 @@ CompressedIdentifierData compress_identifiers_flat(const FastqData &data,
   return result;
 }
 
-CompressedIdentifierData compress_identifiers_columnar(
-    const FastqData &data, const uint8_t *d_raw_bytes,
-    const uint64_t *d_line_offsets, size_t field_slice_size,
-    size_t nvcomp_chunk_size, cudaStream_t stream) {
+CompressedIdentifierData
+compress_identifiers_columnar(const FastqData &data, const uint8_t *d_raw_bytes,
+                              const uint64_t *d_line_offsets,
+                              size_t field_slice_size, size_t nvcomp_chunk_size,
+                              cudaStream_t stream) {
   if (!data.identifier_layout.columnar ||
       data.identifier_layout.column_kinds.empty()) {
     return compress_identifiers_flat(data, field_slice_size, nvcomp_chunk_size);
@@ -779,8 +778,8 @@ CompressedIdentifierData compress_identifiers_columnar(
   unsigned long long *d_invalid_record = nullptr;
   bool fallback_to_flat = false;
   const uint32_t block_size = 256;
-  const uint32_t grid_size = static_cast<uint32_t>(
-      (data.num_records + block_size - 1) / block_size);
+  const uint32_t grid_size =
+      static_cast<uint32_t>((data.num_records + block_size - 1) / block_size);
 
   try {
     schema = copy_identifier_schema_to_device(data.identifier_layout, stream);
@@ -788,9 +787,12 @@ CompressedIdentifierData compress_identifiers_columnar(
       CUDA_CHECK(cudaMalloc(&d_lengths, data.num_records * sizeof(uint32_t)));
       CUDA_CHECK(cudaMalloc(&d_offsets, data.num_records * sizeof(uint64_t)));
       CUDA_CHECK(cudaMalloc(&d_int_values, data.num_records * sizeof(int32_t)));
-      CUDA_CHECK(cudaMalloc(&d_delta_values, data.num_records * sizeof(int32_t)));
-      CUDA_CHECK(cudaMalloc(&d_varint_sizes, data.num_records * sizeof(uint32_t)));
-      CUDA_CHECK(cudaMalloc(&d_varint_offsets, data.num_records * sizeof(uint64_t)));
+      CUDA_CHECK(
+          cudaMalloc(&d_delta_values, data.num_records * sizeof(int32_t)));
+      CUDA_CHECK(
+          cudaMalloc(&d_varint_sizes, data.num_records * sizeof(uint32_t)));
+      CUDA_CHECK(
+          cudaMalloc(&d_varint_offsets, data.num_records * sizeof(uint64_t)));
       CUDA_CHECK(cudaMalloc(&d_invalid_record, sizeof(unsigned long long)));
     }
 
@@ -811,7 +813,7 @@ CompressedIdentifierData compress_identifiers_columnar(
 
       if (out.kind == IdentifierColumnKind::String) {
         extract_identifier_string_lengths_kernel<<<grid_size, block_size, 0,
-                                                  stream>>>(
+                                                   stream>>>(
             d_raw_bytes, d_line_offsets, data.num_records,
             static_cast<uint32_t>(i),
             static_cast<uint32_t>(result.columns.size()),
@@ -829,10 +831,10 @@ CompressedIdentifierData compress_identifiers_columnar(
 
         auto length_begin = thrust::make_transform_iterator(
             thrust::device_pointer_cast(d_lengths), UInt32ToUInt64{});
-        out.raw_text_size = thrust::reduce(
-            thrust::cuda::par.on(stream), length_begin,
-            length_begin + data.num_records, uint64_t{0},
-            thrust::plus<uint64_t>());
+        out.raw_text_size =
+            thrust::reduce(thrust::cuda::par.on(stream), length_begin,
+                           length_begin + data.num_records, uint64_t{0},
+                           thrust::plus<uint64_t>());
 
         if (out.raw_text_size > 0) {
           thrust::exclusive_scan(thrust::cuda::par.on(stream), length_begin,
@@ -841,7 +843,7 @@ CompressedIdentifierData compress_identifiers_columnar(
 
           CUDA_CHECK(cudaMalloc(&d_string_values, out.raw_text_size));
           scatter_identifier_string_values_kernel<<<grid_size, block_size, 0,
-                                                   stream>>>(
+                                                    stream>>>(
               d_raw_bytes, d_line_offsets, data.num_records,
               static_cast<uint32_t>(i),
               static_cast<uint32_t>(result.columns.size()),
@@ -852,7 +854,8 @@ CompressedIdentifierData compress_identifiers_columnar(
           CUDA_CHECK(cudaMemcpy(&invalid_record, d_invalid_record,
                                 sizeof(unsigned long long),
                                 cudaMemcpyDeviceToHost));
-          if (invalid_record != std::numeric_limits<unsigned long long>::max()) {
+          if (invalid_record !=
+              std::numeric_limits<unsigned long long>::max()) {
             fallback_to_flat = true;
             break;
           }
@@ -870,10 +873,11 @@ CompressedIdentifierData compress_identifiers_columnar(
             out.lengths.original_size, field_slice_size, nvcomp_chunk_size,
             stream);
         out.lengths.payload = std::move(length_chunks.data);
-        out.compressed_length_chunk_sizes = std::move(length_chunks.chunk_sizes);
+        out.compressed_length_chunk_sizes =
+            std::move(length_chunks.chunk_sizes);
       } else {
         extract_identifier_int32_values_kernel<<<grid_size, block_size, 0,
-                                                stream>>>(
+                                                 stream>>>(
             d_raw_bytes, d_line_offsets, data.num_records,
             static_cast<uint32_t>(i),
             static_cast<uint32_t>(result.columns.size()),
@@ -891,10 +895,10 @@ CompressedIdentifierData compress_identifiers_columnar(
 
         auto length_begin = thrust::make_transform_iterator(
             thrust::device_pointer_cast(d_lengths), UInt32ToUInt64{});
-        out.raw_text_size = thrust::reduce(
-            thrust::cuda::par.on(stream), length_begin,
-            length_begin + data.num_records, uint64_t{0},
-            thrust::plus<uint64_t>());
+        out.raw_text_size =
+            thrust::reduce(thrust::cuda::par.on(stream), length_begin,
+                           length_begin + data.num_records, uint64_t{0},
+                           thrust::plus<uint64_t>());
 
         const uint64_t plain_size = data.num_records * sizeof(int32_t);
         auto plain_chunks = gpu_compress_device_chunked(
@@ -909,7 +913,7 @@ CompressedIdentifierData compress_identifiers_columnar(
             field_slice_size, nvcomp_chunk_size, stream);
 
         compute_identifier_varint_sizes_kernel<<<grid_size, block_size, 0,
-                                                stream>>>(
+                                                 stream>>>(
             d_delta_values, data.num_records, d_varint_sizes);
         CUDA_CHECK(cudaGetLastError());
         auto varint_begin = thrust::make_transform_iterator(
@@ -925,7 +929,7 @@ CompressedIdentifierData compress_identifiers_columnar(
         if (delta_varint_size > 0) {
           CUDA_CHECK(cudaMalloc(&d_varint_bytes, delta_varint_size));
           scatter_identifier_varints_kernel<<<grid_size, block_size, 0,
-                                             stream>>>(
+                                              stream>>>(
               d_delta_values, d_varint_offsets, data.num_records,
               d_varint_bytes);
           CUDA_CHECK(cudaGetLastError());
@@ -950,12 +954,14 @@ CompressedIdentifierData compress_identifiers_columnar(
           out.encoding = IdentifierColumnEncoding::Delta;
           out.values.original_size = plain_size;
           out.values.payload = std::move(delta_chunks.data);
-          out.compressed_value_chunk_sizes = std::move(delta_chunks.chunk_sizes);
+          out.compressed_value_chunk_sizes =
+              std::move(delta_chunks.chunk_sizes);
         } else {
           out.encoding = IdentifierColumnEncoding::Plain;
           out.values.original_size = plain_size;
           out.values.payload = std::move(plain_chunks.data);
-          out.compressed_value_chunk_sizes = std::move(plain_chunks.chunk_sizes);
+          out.compressed_value_chunk_sizes =
+              std::move(plain_chunks.chunk_sizes);
         }
       }
 
@@ -995,8 +1001,9 @@ CompressedIdentifierData compress_identifiers_columnar(
   return result;
 }
 
-std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data,
-                                            uint64_t num_records) {
+std::vector<uint8_t>
+decompress_identifiers(const CompressedIdentifierData &data,
+                       uint64_t num_records) {
   if (data.mode == IdentifierCompressionMode::Flat) {
     return gpu_decompress_chunked(data.flat_data.payload,
                                   data.compressed_flat_chunk_sizes,
@@ -1026,14 +1033,15 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
   for (size_t i = 0; i < data.columns.size(); ++i) {
     columns[i].kind = data.columns[i].kind;
     columns[i].encoding = data.columns[i].encoding;
-    columns[i].value_bytes = gpu_decompress_chunked(
-        data.columns[i].values.payload, data.columns[i].compressed_value_chunk_sizes,
-        data.columns[i].values.original_size);
+    columns[i].value_bytes =
+        gpu_decompress_chunked(data.columns[i].values.payload,
+                               data.columns[i].compressed_value_chunk_sizes,
+                               data.columns[i].values.original_size);
     if (columns[i].kind == IdentifierColumnKind::String) {
-      const auto length_bytes = gpu_decompress_chunked(
-          data.columns[i].lengths.payload,
-          data.columns[i].compressed_length_chunk_sizes,
-          data.columns[i].lengths.original_size);
+      const auto length_bytes =
+          gpu_decompress_chunked(data.columns[i].lengths.payload,
+                                 data.columns[i].compressed_length_chunk_sizes,
+                                 data.columns[i].lengths.original_size);
       if (length_bytes.size() != num_records * sizeof(uint32_t)) {
         throw std::runtime_error(
             "Decoded identifier string-length payload has an unexpected size");
@@ -1073,8 +1081,10 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
   for (uint64_t record = 0; record < num_records; ++record) {
     for (size_t column = 0; column < columns.size(); ++column) {
       if (columns[column].kind == IdentifierColumnKind::String) {
-        const uint32_t len = columns[column].lengths[static_cast<size_t>(record)];
-        if (columns[column].value_offset + len > columns[column].value_bytes.size()) {
+        const uint32_t len =
+            columns[column].lengths[static_cast<size_t>(record)];
+        if (columns[column].value_offset + len >
+            columns[column].value_bytes.size()) {
           throw std::runtime_error(
               "Decoded identifier string column exceeds its payload");
         }
@@ -1083,7 +1093,8 @@ std::vector<uint8_t> decompress_identifiers(const CompressedIdentifierData &data
             columns[column].value_bytes.begin() +
                 static_cast<std::ptrdiff_t>(columns[column].value_offset),
             columns[column].value_bytes.begin() +
-                static_cast<std::ptrdiff_t>(columns[column].value_offset + len));
+                static_cast<std::ptrdiff_t>(columns[column].value_offset +
+                                            len));
         columns[column].value_offset += len;
       } else {
         const auto token = std::to_string(columns[column].int_values[record]);
@@ -1162,8 +1173,7 @@ __global__ void gather_fields_kernel(
   }
 }
 
-__device__ inline uint8_t encode_basecall_2bit(uint8_t base,
-                                               bool *is_n,
+__device__ inline uint8_t encode_basecall_2bit(uint8_t base, bool *is_n,
                                                bool *is_valid) {
   switch (base) {
   case 'A':
@@ -1215,8 +1225,9 @@ __global__ void count_n_basecalls_kernel(const uint8_t *basecalls,
   }
   __syncthreads();
 
-  const uint64_t block_end = min(
-      block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE), basecall_count);
+  const uint64_t block_end =
+      min(block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE),
+          basecall_count);
   uint32_t local_count = 0;
   for (uint64_t index = block_start + threadIdx.x; index < block_end;
        index += blockDim.x) {
@@ -1292,8 +1303,9 @@ __global__ void scatter_n_positions_kernel(const uint8_t *basecalls,
   }
   __syncthreads();
 
-  const uint64_t block_end = min(
-      block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE), basecall_count);
+  const uint64_t block_end =
+      min(block_start + static_cast<uint64_t>(BASECALL_N_BLOCK_SIZE),
+          basecall_count);
   for (uint64_t index = block_start + threadIdx.x; index < block_end;
        index += blockDim.x) {
     bool is_n = false;
@@ -1441,9 +1453,8 @@ BscChunkedBuffer bsc_compress_device_chunked(const uint8_t *d_input,
         }
         queue_cv.notify_all();
 
-        auto compressed =
-            bsc_compress_block(chunk.data.data(), chunk.data.size(),
-                               resolved.backend);
+        auto compressed = bsc_compress_block(
+            chunk.data.data(), chunk.data.size(), resolved.backend);
         result.compressed_chunk_sizes[chunk.index] =
             static_cast<uint64_t>(compressed.size());
         result.uncompressed_chunk_sizes[chunk.index] = chunk.data.size();
@@ -1575,7 +1586,8 @@ CompressedBasecallData compress_basecalls_device(const uint8_t *d_basecalls,
 
     const uint32_t pack_grid_size = static_cast<uint32_t>(
         (packed_size + kernel_block_size - 1) / kernel_block_size);
-    pack_basecalls_2bit_kernel<<<pack_grid_size, kernel_block_size, 0, stream>>>(
+    pack_basecalls_2bit_kernel<<<pack_grid_size, kernel_block_size, 0,
+                                 stream>>>(
         d_basecalls, basecall_count, encoded.packed_bases, d_invalid_position);
     CUDA_CHECK(cudaGetLastError());
 
@@ -1674,12 +1686,14 @@ decode_basecalls(const CompressedBasecallData &compressed,
   if (n_count_bytes.size() != expected_block_count * sizeof(uint16_t)) {
     throw std::runtime_error("Decoded basecall N-count metadata is invalid");
   }
-  const auto *n_counts = reinterpret_cast<const uint16_t *>(n_count_bytes.data());
+  const auto *n_counts =
+      reinterpret_cast<const uint16_t *>(n_count_bytes.data());
 
   const size_t expected_packed_size =
       static_cast<size_t>((compressed.original_size + 3) / 4);
   if (packed_bases.size() != expected_packed_size) {
-    throw std::runtime_error("Decoded packed basecalls have an unexpected size");
+    throw std::runtime_error(
+        "Decoded packed basecalls have an unexpected size");
   }
 
   uint64_t total_n_count = 0;
@@ -1687,25 +1701,27 @@ decode_basecalls(const CompressedBasecallData &compressed,
     total_n_count += n_counts[i];
   }
   if (n_position_bytes.size() != total_n_count * sizeof(uint16_t)) {
-    throw std::runtime_error("Decoded N-position payload has an unexpected size");
+    throw std::runtime_error(
+        "Decoded N-position payload has an unexpected size");
   }
 
   std::vector<uint8_t> basecalls(compressed.original_size);
   static constexpr uint8_t BASECALL_DECODE_TABLE[4] = {'A', 'C', 'G', 'T'};
   for (uint64_t index = 0; index < compressed.original_size; ++index) {
     const uint8_t packed_value = packed_bases[index / 4];
-    const uint8_t code = static_cast<uint8_t>((packed_value >> (2 * (index % 4))) & 0x3);
+    const uint8_t code =
+        static_cast<uint8_t>((packed_value >> (2 * (index % 4))) & 0x3);
     basecalls[index] = BASECALL_DECODE_TABLE[code];
   }
 
   const auto *n_positions =
       reinterpret_cast<const uint16_t *>(n_position_bytes.data());
   uint64_t n_offset = 0;
-  for (uint64_t block_index = 0; block_index < expected_block_count; ++block_index) {
+  for (uint64_t block_index = 0; block_index < expected_block_count;
+       ++block_index) {
     const uint64_t block_start = block_index * compressed.n_block_size;
-    const uint64_t block_end =
-        std::min<uint64_t>(block_start + compressed.n_block_size,
-                           compressed.original_size);
+    const uint64_t block_end = std::min<uint64_t>(
+        block_start + compressed.n_block_size, compressed.original_size);
     for (uint16_t count = 0; count < n_counts[block_index]; ++count) {
       const uint16_t local_index = n_positions[n_offset++];
       if (block_start + local_index >= block_end) {
@@ -1994,13 +2010,15 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
       result.identifiers =
           compress_identifiers_columnar(data, d_raw_bytes, d_line_offsets,
                                         field_slice_size, chunk_size, stream);
-      uint64_t compressed_identifier_size = result.identifiers.flat_data.payload.size();
+      uint64_t compressed_identifier_size =
+          result.identifiers.flat_data.payload.size();
       for (const auto &column : result.identifiers.columns) {
         compressed_identifier_size += column.values.payload.size();
         compressed_identifier_size += column.lengths.payload.size();
       }
       std::cerr << "  Mode: "
-                << (result.identifiers.mode == IdentifierCompressionMode::Columnar
+                << (result.identifiers.mode ==
+                            IdentifierCompressionMode::Columnar
                         ? "columnar"
                         : "flat")
                 << std::endl;
@@ -2016,16 +2034,15 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
           const uint64_t raw_total = raw_value_size + raw_length_size;
           const uint64_t comp_total = comp_value_size + comp_length_size;
           std::cerr << "    [" << i << "] "
-                    << identifier_column_kind_name(column.kind)
-                    << "/" << identifier_column_encoding_name(column.encoding)
-                    << " values " << raw_value_size << " -> "
-                    << comp_value_size << " B";
+                    << identifier_column_kind_name(column.kind) << "/"
+                    << identifier_column_encoding_name(column.encoding)
+                    << " values " << raw_value_size << " -> " << comp_value_size
+                    << " B";
           if (column.kind == IdentifierColumnKind::String) {
             std::cerr << ", lengths " << raw_length_size << " -> "
                       << comp_length_size << " B";
           }
-          std::cerr << ", total " << raw_total << " -> " << comp_total
-                    << " B ("
+          std::cerr << ", total " << raw_total << " -> " << comp_total << " B ("
                     << compression_ratio_percent(comp_total, raw_total) << " %)"
                     << std::endl;
         }
@@ -2033,9 +2050,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
       std::cerr << "  -> " << compressed_identifier_size << " bytes"
                 << std::endl;
     } else {
-      auto id_chunks =
-          gpu_compress_device_chunked(fields.identifiers, stats.identifiers_size,
-                                      field_slice_size, chunk_size, stream);
+      auto id_chunks = gpu_compress_device_chunked(
+          fields.identifiers, stats.identifiers_size, field_slice_size,
+          chunk_size, stream);
       result.identifiers.mode = IdentifierCompressionMode::Flat;
       result.identifiers.flat_data.original_size = stats.identifiers_size;
       result.identifiers.flat_data.payload = std::move(id_chunks.data);
@@ -2053,10 +2070,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "Compressing basecalls (" << stats.basecalls_size
               << " bytes)..." << std::endl;
     const auto basecall_start = Clock::now();
-    result.basecalls = compress_basecalls_device(fields.basecalls,
-                                                 stats.basecalls_size,
-                                                 field_slice_size, chunk_size,
-                                                 stream);
+    result.basecalls =
+        compress_basecalls_device(fields.basecalls, stats.basecalls_size,
+                                  field_slice_size, chunk_size, stream);
     const uint64_t compressed_basecall_size =
         result.basecalls.packed_bases.payload.size() +
         result.basecalls.n_counts.payload.size() +
@@ -2065,18 +2081,22 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     const uint64_t basecall_block_count =
         result.basecalls.original_size == 0
             ? 0
-            : (result.basecalls.original_size + result.basecalls.n_block_size - 1) /
+            : (result.basecalls.original_size + result.basecalls.n_block_size -
+               1) /
                   result.basecalls.n_block_size;
     if (result.basecalls.n_counts.original_size !=
         basecall_block_count * sizeof(uint16_t)) {
-      throw std::runtime_error("Compressed N-count payload has an unexpected size");
+      throw std::runtime_error(
+          "Compressed N-count payload has an unexpected size");
     }
     if (result.basecalls.n_positions.original_size % sizeof(uint16_t) != 0) {
       throw std::runtime_error(
           "Compressed N-position payload has an unexpected size");
     }
-    total_n_count = result.basecalls.n_positions.original_size / sizeof(uint16_t);
-    std::cerr << "  Packed bases: " << result.basecalls.packed_bases.original_size
+    total_n_count =
+        result.basecalls.n_positions.original_size / sizeof(uint16_t);
+    std::cerr << "  Packed bases: "
+              << result.basecalls.packed_bases.original_size
               << " bytes, N positions: " << total_n_count << std::endl;
     std::cerr << "  -> " << compressed_basecall_size << " bytes" << std::endl;
     basecall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2087,10 +2107,21 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     std::cerr << "Compressing quality scores (" << stats.quality_scores_size
               << " bytes)..." << std::endl;
     const auto quality_start = Clock::now();
+    bool do_transpose = data.quality_layout == QualityLayoutKind::FixedLength &&
+                        data.fixed_quality_length != 0 &&
+                        bsc_config.quality_codec == QualityCodec::Zstd &&
+                        bsc_config.zstd_transpose_quality;
+    result.quality_transposed = do_transpose;
+
     if (data.quality_layout == QualityLayoutKind::FixedLength &&
         data.fixed_quality_length != 0) {
-      std::cerr << "  Layout: row-major fixed-length (column-major disabled)"
-                << std::endl;
+      if (do_transpose) {
+        std::cerr << "  Layout: column-major fixed-length (transposed)"
+                  << std::endl;
+      } else {
+        std::cerr << "  Layout: row-major fixed-length (column-major disabled)"
+                  << std::endl;
+      }
     } else {
       std::cerr << "  Layout: row-major variable-length" << std::endl;
     }
@@ -2099,6 +2130,20 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
     result.compressed_quality_chunk_sizes.clear();
     result.uncompressed_quality_chunk_sizes.clear();
     if (bsc_config.quality_codec == QualityCodec::Zstd) {
+      std::vector<uint8_t> transposed_host;
+      if (do_transpose) {
+        std::vector<uint8_t> host_quality(stats.quality_scores_size);
+        CUDA_CHECK(cudaMemcpyAsync(host_quality.data(), fields.quality_scores,
+                                   stats.quality_scores_size,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        transposed_host = transpose_fixed_length_quality_scores(
+            host_quality, data.num_records, data.fixed_quality_length);
+        CUDA_CHECK(cudaMemcpyAsync(
+            fields.quality_scores, transposed_host.data(),
+            stats.quality_scores_size, cudaMemcpyHostToDevice, stream));
+      }
+
       auto qual_chunks = gpu_compress_device_chunked(
           fields.quality_scores, stats.quality_scores_size, field_slice_size,
           chunk_size, stream);
@@ -2109,8 +2154,9 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
           result.compressed_quality_chunk_sizes.size());
       for (size_t offset = 0; offset < stats.quality_scores_size;
            offset += field_slice_size) {
-        result.uncompressed_quality_chunk_sizes.push_back(std::min(
-            field_slice_size, static_cast<size_t>(stats.quality_scores_size - offset)));
+        result.uncompressed_quality_chunk_sizes.push_back(
+            std::min(field_slice_size,
+                     static_cast<size_t>(stats.quality_scores_size - offset)));
       }
     } else {
       const size_t quality_chunk_count =
@@ -2205,11 +2251,12 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;
-  const auto n_count_bytes = nvcomp_zstd_decompress(compressed.basecalls.n_counts);
-  const auto packed_bases = gpu_decompress_chunked(
-      compressed.basecalls.packed_bases.payload,
-      compressed.basecalls.compressed_packed_chunk_sizes,
-      compressed.basecalls.packed_bases.original_size);
+  const auto n_count_bytes =
+      nvcomp_zstd_decompress(compressed.basecalls.n_counts);
+  const auto packed_bases =
+      gpu_decompress_chunked(compressed.basecalls.packed_bases.payload,
+                             compressed.basecalls.compressed_packed_chunk_sizes,
+                             compressed.basecalls.packed_bases.original_size);
   const auto n_position_bytes = gpu_decompress_chunked(
       compressed.basecalls.n_positions.payload,
       compressed.basecalls.compressed_n_position_chunk_sizes,
@@ -2223,17 +2270,16 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
             << std::endl;
   std::vector<uint8_t> quality_scores;
   if (compressed.quality_codec == QualityCodec::Zstd) {
-    quality_scores = gpu_decompress_chunked(
-        compressed.quality_scores.payload,
-        compressed.compressed_quality_chunk_sizes,
-        compressed.quality_scores.original_size);
+    quality_scores =
+        gpu_decompress_chunked(compressed.quality_scores.payload,
+                               compressed.compressed_quality_chunk_sizes,
+                               compressed.quality_scores.original_size);
   } else {
     const auto resolved_bsc = resolve_bsc_config(
         bsc_config, compressed.compressed_quality_chunk_sizes.size());
     std::cerr << "  BSC backend: " << bsc_backend_name(resolved_bsc.backend)
-              << ", jobs: " << resolved_bsc.parallelism
-              << ", chunks: " << compressed.compressed_quality_chunk_sizes.size()
-              << std::endl;
+              << ", jobs: " << resolved_bsc.parallelism << ", chunks: "
+              << compressed.compressed_quality_chunk_sizes.size() << std::endl;
     quality_scores = bsc_decompress_chunked(
         compressed.quality_scores.payload,
         compressed.compressed_quality_chunk_sizes,
@@ -2244,11 +2290,17 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   const std::vector<uint8_t> *quality_scores_for_rebuild = &quality_scores;
   if (compressed.quality_layout == QualityLayoutKind::FixedLength &&
       compressed.fixed_quality_length != 0) {
-    reordered_quality_scores = inverse_transpose_fixed_length_quality_scores(
-        quality_scores, compressed.num_records, compressed.fixed_quality_length);
-    quality_scores_for_rebuild = &reordered_quality_scores;
-    std::cerr << "  Layout: column-major fixed-length ("
-              << compressed.fixed_quality_length << " bases)" << std::endl;
+    if (compressed.quality_transposed) {
+      reordered_quality_scores = inverse_transpose_fixed_length_quality_scores(
+          quality_scores, compressed.num_records,
+          compressed.fixed_quality_length);
+      quality_scores_for_rebuild = &reordered_quality_scores;
+      std::cerr << "  Layout: column-major fixed-length (transposed, "
+                << compressed.fixed_quality_length << " bases)" << std::endl;
+    } else {
+      std::cerr << "  Layout: row-major fixed-length (column-major disabled, "
+                << compressed.fixed_quality_length << " bases)" << std::endl;
+    }
   } else {
     std::cerr << "  Layout: row-major variable-length" << std::endl;
   }
@@ -2300,8 +2352,7 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   cuda_free_if_set(d_line_lengths);
   cudaStreamDestroy(stream);
   return rebuild_fastq(line_offsets, identifiers, basecalls,
-                       *quality_scores_for_rebuild,
-                       compressed.num_records);
+                       *quality_scores_for_rebuild, compressed.num_records);
 }
 
 } // namespace gpufastq

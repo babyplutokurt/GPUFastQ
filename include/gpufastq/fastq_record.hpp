@@ -104,6 +104,7 @@ struct CompressedFastqData {
   QualityCodec quality_codec = QualityCodec::Bsc;
   QualityLayoutKind quality_layout = QualityLayoutKind::FixedLength;
   uint32_t fixed_quality_length = 0;
+  bool quality_transposed = false;
 
   std::vector<uint64_t> compressed_quality_chunk_sizes;
   std::vector<uint64_t> uncompressed_quality_chunk_sizes;

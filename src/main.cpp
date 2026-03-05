@@ -14,7 +14,8 @@ size_t parse_positive_size_arg(const std::string &flag,
   size_t pos = 0;
   const unsigned long long parsed = std::stoull(value, &pos, 10);
   if (pos != value.size() || parsed == 0 ||
-      parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+      parsed >
+          static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
     throw std::runtime_error(flag + " must be a positive integer");
   }
   return static_cast<size_t>(parsed);
@@ -43,24 +44,28 @@ gpufastq::QualityCodec parse_quality_codec_arg(const std::string &value) {
 } // namespace
 
 void print_usage(const char *prog) {
-  std::cerr << "GPUFastQ — GPU-accelerated FASTQ compression (nvcomp zstd)\n\n"
-            << "Usage:\n"
-            << "  " << prog
-            << " compress   [options] <input.fastq> <output.gpufq>\n"
-            << "  " << prog
-            << " decompress [options] <input.gpufq> <output.fastq>\n"
-            << "  " << prog
-            << " roundtrip  [options] <input.fastq>\n\n"
-            << "Options:\n"
-            << "  --quality-codec C  Quality codec: bsc or zstd\n"
-            << "  --bsc-backend B    BSC backend for quality scores: cpu or cuda\n"
-            << "  --bsc-threads N    Override CPU worker count for CPU BSC mode\n"
-            << "  --bsc-gpu-jobs N   Override concurrent chunk jobs for CUDA BSC mode\n\n"
-            << "Environment:\n"
-            << "  GPUFASTQ_BSC_BACKEND  Default BSC backend when --bsc-backend is not set\n"
-            << "  GPUFASTQ_BSC_THREADS  Default CPU worker count when --bsc-threads is not set\n"
-            << "  GPUFASTQ_BSC_GPU_JOBS Default CUDA chunk job count when --bsc-gpu-jobs is not set\n"
-            << std::endl;
+  std::cerr
+      << "GPUFastQ — GPU-accelerated FASTQ compression (nvcomp zstd)\n\n"
+      << "Usage:\n"
+      << "  " << prog << " compress   [options] <input.fastq> <output.gpufq>\n"
+      << "  " << prog << " decompress [options] <input.gpufq> <output.fastq>\n"
+      << "  " << prog << " roundtrip  [options] <input.fastq>\n\n"
+      << "Options:\n"
+      << "  --quality-codec C  Quality codec: bsc or zstd\n"
+      << "  --bsc-backend B    BSC backend for quality scores: cpu or cuda\n"
+      << "  --bsc-threads N    Override CPU worker count for CPU BSC mode\n"
+      << "  --bsc-gpu-jobs N   Override concurrent chunk jobs for CUDA BSC "
+         "mode\n"
+      << "  --transpose        Transpose fixed-length quality scores before "
+         "Zstd compression\n\n"
+      << "Environment:\n"
+      << "  GPUFASTQ_BSC_BACKEND  Default BSC backend when --bsc-backend is "
+         "not set\n"
+      << "  GPUFASTQ_BSC_THREADS  Default CPU worker count when --bsc-threads "
+         "is not set\n"
+      << "  GPUFASTQ_BSC_GPU_JOBS Default CUDA chunk job count when "
+         "--bsc-gpu-jobs is not set\n"
+      << std::endl;
 }
 
 int main(int argc, char *argv[]) {
@@ -77,8 +82,12 @@ int main(int argc, char *argv[]) {
 
     for (int argi = 2; argi < argc; ++argi) {
       const std::string arg = argv[argi];
-      if (arg == "--quality-codec" || arg == "--bsc-backend" || arg == "--bsc-threads" ||
-          arg == "--bsc-gpu-jobs") {
+      if (arg == "--transpose") {
+        bsc_config.zstd_transpose_quality = true;
+        continue;
+      }
+      if (arg == "--quality-codec" || arg == "--bsc-backend" ||
+          arg == "--bsc-threads" || arg == "--bsc-gpu-jobs") {
         if (argi + 1 >= argc) {
           throw std::runtime_error("Missing value for " + arg);
         }
@@ -98,8 +107,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (cmd == "compress" && positional_args.size() >= 2)
-      return gpufastq::workflow::compress(positional_args[0], positional_args[1],
-                                          bsc_config);
+      return gpufastq::workflow::compress(positional_args[0],
+                                          positional_args[1], bsc_config);
     if (cmd == "decompress" && positional_args.size() >= 2)
       return gpufastq::workflow::decompress(positional_args[0],
                                             positional_args[1], bsc_config);

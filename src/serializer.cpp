@@ -102,9 +102,9 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
       throw std::runtime_error(
           "Cannot serialize string identifier column with invalid length size");
     }
-    validate_chunked_stream(column.lengths.payload, column.lengths.original_size,
-                            column.compressed_length_chunk_sizes,
-                            "identifier-column-lengths");
+    validate_chunked_stream(
+        column.lengths.payload, column.lengths.original_size,
+        column.compressed_length_chunk_sizes, "identifier-column-lengths");
     return;
   }
 
@@ -120,13 +120,13 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
   if ((column.encoding == IdentifierColumnEncoding::Plain ||
        column.encoding == IdentifierColumnEncoding::Delta) &&
       column.values.original_size != num_records * sizeof(int32_t)) {
-    throw std::runtime_error(
-        "Cannot serialize fixed-width numeric identifier column with invalid value size");
+    throw std::runtime_error("Cannot serialize fixed-width numeric identifier "
+                             "column with invalid value size");
   }
   if (column.encoding == IdentifierColumnEncoding::DeltaVarint &&
       column.values.original_size == 0 && num_records != 0) {
-    throw std::runtime_error(
-        "Cannot serialize delta-varint numeric identifier column with empty values");
+    throw std::runtime_error("Cannot serialize delta-varint numeric identifier "
+                             "column with empty values");
   }
   if (column.lengths.original_size != 0 || !column.lengths.payload.empty() ||
       !column.compressed_length_chunk_sizes.empty()) {
@@ -138,7 +138,8 @@ void validate_identifier_column(const CompressedIdentifierColumn &column,
 void validate_identifier_stream(const CompressedIdentifierData &data,
                                 uint64_t num_records) {
   if (data.mode == IdentifierCompressionMode::Flat) {
-    validate_chunked_stream(data.flat_data.payload, data.flat_data.original_size,
+    validate_chunked_stream(data.flat_data.payload,
+                            data.flat_data.original_size,
                             data.compressed_flat_chunk_sizes, "identifier");
     if (!data.columns.empty() || data.layout.columnar ||
         !data.layout.separators.empty() || !data.layout.column_kinds.empty()) {
@@ -177,15 +178,14 @@ void validate_identifier_stream(const CompressedIdentifierData &data,
 
 void validate_basecall_stream(const CompressedBasecallData &data) {
   if (data.original_size == 0) {
-    const bool has_data = data.n_block_size != 0 ||
-                          data.packed_bases.original_size != 0 ||
-                          !data.packed_bases.payload.empty() ||
-                          !data.compressed_packed_chunk_sizes.empty() ||
-                          data.n_counts.original_size != 0 ||
-                          !data.n_counts.payload.empty() ||
-                          data.n_positions.original_size != 0 ||
-                          !data.n_positions.payload.empty() ||
-                          !data.compressed_n_position_chunk_sizes.empty();
+    const bool has_data =
+        data.n_block_size != 0 || data.packed_bases.original_size != 0 ||
+        !data.packed_bases.payload.empty() ||
+        !data.compressed_packed_chunk_sizes.empty() ||
+        data.n_counts.original_size != 0 || !data.n_counts.payload.empty() ||
+        data.n_positions.original_size != 0 ||
+        !data.n_positions.payload.empty() ||
+        !data.compressed_n_position_chunk_sizes.empty();
     if (has_data) {
       throw std::runtime_error(
           "Cannot serialize inconsistent empty basecall metadata");
@@ -211,10 +211,9 @@ void validate_basecall_stream(const CompressedBasecallData &data) {
         "Cannot serialize basecall metadata with an unexpected packed size");
   }
 
-  validate_chunked_stream(data.packed_bases.payload,
-                          data.packed_bases.original_size,
-                          data.compressed_packed_chunk_sizes,
-                          "packed-basecall");
+  validate_chunked_stream(
+      data.packed_bases.payload, data.packed_bases.original_size,
+      data.compressed_packed_chunk_sizes, "packed-basecall");
   if ((data.n_counts.original_size == 0) != data.n_counts.payload.empty()) {
     throw std::runtime_error(
         "Cannot serialize inconsistent compressed N-count metadata");
@@ -258,8 +257,8 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
     } else if (data.quality_scores.original_size !=
                static_cast<uint64_t>(data.fixed_quality_length) *
                    data.num_records) {
-      throw std::runtime_error(
-          "Cannot serialize fixed-length quality metadata with inconsistent size");
+      throw std::runtime_error("Cannot serialize fixed-length quality metadata "
+                               "with inconsistent size");
     }
   } else if (data.fixed_quality_length != 0) {
     throw std::runtime_error(
@@ -275,10 +274,9 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
     throw std::runtime_error(
         "Cannot serialize mismatched quality chunk size vectors");
   }
-  validate_chunked_stream(data.line_lengths.payload,
-                          data.line_lengths.original_size,
-                          data.compressed_line_length_chunk_sizes,
-                          "line-length");
+  validate_chunked_stream(
+      data.line_lengths.payload, data.line_lengths.original_size,
+      data.compressed_line_length_chunk_sizes, "line-length");
 
   write_val(file, MAGIC);
   write_val(file, FORMAT_VERSION);
@@ -292,28 +290,35 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_val(file,
             static_cast<uint64_t>(data.identifiers.layout.column_kinds.size()));
   write_val(file, static_cast<uint64_t>(data.identifiers.columns.size()));
-  write_val(file, static_cast<uint64_t>(data.identifiers.flat_data.original_size));
-  write_val(file, static_cast<uint64_t>(data.identifiers.flat_data.payload.size()));
+  write_val(file,
+            static_cast<uint64_t>(data.identifiers.flat_data.original_size));
+  write_val(file,
+            static_cast<uint64_t>(data.identifiers.flat_data.payload.size()));
   write_val(file, static_cast<uint64_t>(
-                     data.identifiers.compressed_flat_chunk_sizes.size()));
+                      data.identifiers.compressed_flat_chunk_sizes.size()));
 
   write_val(file, data.basecalls.original_size);
   write_val(file, data.basecalls.n_block_size);
-  write_val(file, static_cast<uint64_t>(data.basecalls.packed_bases.original_size));
-  write_val(file, static_cast<uint64_t>(data.basecalls.packed_bases.payload.size()));
-  write_val(
-      file,
-      static_cast<uint64_t>(data.basecalls.compressed_packed_chunk_sizes.size()));
-  write_val(file, static_cast<uint64_t>(data.basecalls.n_counts.original_size));
-  write_val(file, static_cast<uint64_t>(data.basecalls.n_counts.payload.size()));
-  write_val(file, static_cast<uint64_t>(data.basecalls.n_positions.original_size));
-  write_val(file, static_cast<uint64_t>(data.basecalls.n_positions.payload.size()));
+  write_val(file,
+            static_cast<uint64_t>(data.basecalls.packed_bases.original_size));
+  write_val(file,
+            static_cast<uint64_t>(data.basecalls.packed_bases.payload.size()));
   write_val(file, static_cast<uint64_t>(
-                     data.basecalls.compressed_n_position_chunk_sizes.size()));
+                      data.basecalls.compressed_packed_chunk_sizes.size()));
+  write_val(file, static_cast<uint64_t>(data.basecalls.n_counts.original_size));
+  write_val(file,
+            static_cast<uint64_t>(data.basecalls.n_counts.payload.size()));
+  write_val(file,
+            static_cast<uint64_t>(data.basecalls.n_positions.original_size));
+  write_val(file,
+            static_cast<uint64_t>(data.basecalls.n_positions.payload.size()));
+  write_val(file, static_cast<uint64_t>(
+                      data.basecalls.compressed_n_position_chunk_sizes.size()));
 
   write_val(file, static_cast<uint8_t>(data.quality_codec));
   write_val(file, static_cast<uint8_t>(data.quality_layout));
   write_val(file, data.fixed_quality_length);
+  write_val(file, static_cast<uint8_t>(data.quality_transposed ? 1 : 0));
   write_val(file, static_cast<uint64_t>(data.quality_scores.original_size));
   write_val(file, static_cast<uint64_t>(data.quality_scores.payload.size()));
   write_val(file,
@@ -321,8 +326,8 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
 
   write_val(file, static_cast<uint64_t>(data.line_lengths.original_size));
   write_val(file, static_cast<uint64_t>(data.line_lengths.payload.size()));
-  write_val(file,
-            static_cast<uint64_t>(data.compressed_line_length_chunk_sizes.size()));
+  write_val(file, static_cast<uint64_t>(
+                      data.compressed_line_length_chunk_sizes.size()));
 
   for (const auto &separator : data.identifiers.layout.separators) {
     write_string(file, separator);
@@ -337,12 +342,12 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
     write_val(file, static_cast<uint64_t>(column.raw_text_size));
     write_val(file, static_cast<uint64_t>(column.values.original_size));
     write_val(file, static_cast<uint64_t>(column.values.payload.size()));
-    write_val(file,
-              static_cast<uint64_t>(column.compressed_value_chunk_sizes.size()));
+    write_val(file, static_cast<uint64_t>(
+                        column.compressed_value_chunk_sizes.size()));
     write_val(file, static_cast<uint64_t>(column.lengths.original_size));
     write_val(file, static_cast<uint64_t>(column.lengths.payload.size()));
-    write_val(file,
-              static_cast<uint64_t>(column.compressed_length_chunk_sizes.size()));
+    write_val(file, static_cast<uint64_t>(
+                        column.compressed_length_chunk_sizes.size()));
     write_index(file, column.compressed_value_chunk_sizes);
     write_index(file, column.compressed_length_chunk_sizes);
   }
@@ -385,7 +390,8 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.num_records = read_val<uint64_t>(file);
   data.line_offset_count = read_val<uint64_t>(file);
 
-  data.identifiers.mode = static_cast<IdentifierCompressionMode>(read_val<uint8_t>(file));
+  data.identifiers.mode =
+      static_cast<IdentifierCompressionMode>(read_val<uint8_t>(file));
   data.identifiers.original_size = read_val<uint64_t>(file);
   const uint64_t identifier_separator_count = read_val<uint64_t>(file);
   const uint64_t identifier_kind_count = read_val<uint64_t>(file);
@@ -408,6 +414,7 @@ CompressedFastqData deserialize(const std::string &filepath) {
   data.quality_codec = static_cast<QualityCodec>(read_val<uint8_t>(file));
   data.quality_layout = static_cast<QualityLayoutKind>(read_val<uint8_t>(file));
   data.fixed_quality_length = read_val<uint32_t>(file);
+  data.quality_transposed = read_val<uint8_t>(file) != 0;
   data.quality_scores.original_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_size = read_val<uint64_t>(file);
   const uint64_t comp_qual_chunks = read_val<uint64_t>(file);
@@ -429,7 +436,8 @@ CompressedFastqData deserialize(const std::string &filepath) {
   }
   data.identifiers.layout.columnar =
       data.identifiers.mode == IdentifierCompressionMode::Columnar;
-  data.identifiers.compressed_flat_chunk_sizes = read_index(file, comp_id_chunks);
+  data.identifiers.compressed_flat_chunk_sizes =
+      read_index(file, comp_id_chunks);
   data.identifiers.columns.resize(static_cast<size_t>(identifier_column_count));
   std::vector<uint64_t> identifier_value_payload_sizes(
       static_cast<size_t>(identifier_column_count));
