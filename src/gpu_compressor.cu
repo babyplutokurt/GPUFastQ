@@ -2250,12 +2250,21 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
 
 FastqData decompress_fastq(const CompressedFastqData &compressed,
                            const BscConfig &bsc_config) {
+  using Clock = std::chrono::high_resolution_clock;
+  const auto decompress_start = Clock::now();
+
   std::cerr << "Decompressing identifiers..." << std::endl;
+  const auto identifier_start = Clock::now();
   const auto identifiers =
       decompress_identifiers(compressed.identifiers, compressed.num_records);
+  const auto identifier_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                            identifier_start)
+          .count();
   std::cerr << "  -> " << identifiers.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing basecalls..." << std::endl;
+  const auto basecall_start = Clock::now();
   const auto n_count_bytes =
       nvcomp_zstd_decompress(compressed.basecalls.n_counts);
   const auto packed_bases =
@@ -2268,9 +2277,14 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
       compressed.basecalls.n_positions.original_size);
   const auto basecalls = decode_basecalls(compressed.basecalls, n_count_bytes,
                                           packed_bases, n_position_bytes);
+  const auto basecall_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                            basecall_start)
+          .count();
   std::cerr << "  -> " << basecalls.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing quality scores..." << std::endl;
+  const auto quality_start = Clock::now();
   std::cerr << "  Codec: " << quality_codec_name(compressed.quality_codec)
             << std::endl;
   std::vector<uint8_t> quality_scores;
@@ -2309,13 +2323,21 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   } else {
     std::cerr << "  Layout: row-major variable-length" << std::endl;
   }
+  const auto quality_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              Clock::now() - quality_start)
+                              .count();
   std::cerr << "  -> " << quality_scores.size() << " bytes" << std::endl;
 
   std::cerr << "Decompressing line lengths..." << std::endl;
+  const auto line_length_start = Clock::now();
   const auto line_offset_bytes =
       gpu_decompress_chunked(compressed.line_lengths.payload,
                              compressed.compressed_line_length_chunk_sizes,
                              compressed.line_lengths.original_size);
+  const auto line_length_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                            line_length_start)
+          .count();
   std::cerr << "  -> " << line_offset_bytes.size() << " bytes" << std::endl;
 
   if (compressed.line_offset_count == 0) {
@@ -2356,8 +2378,30 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
   cuda_free_if_set(d_line_offsets);
   cuda_free_if_set(d_line_lengths);
   cudaStreamDestroy(stream);
-  return rebuild_fastq(line_offsets, identifiers, basecalls,
-                       *quality_scores_for_rebuild, compressed.num_records);
+
+  std::cerr << "Rebuilding FASTQ..." << std::endl;
+  const auto rebuild_start = Clock::now();
+  auto result =
+      rebuild_fastq(line_offsets, identifiers, basecalls,
+                    *quality_scores_for_rebuild, compressed.num_records);
+  const auto rebuild_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              Clock::now() - rebuild_start)
+                              .count();
+
+  if (bsc_config.stat_mode) {
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              Clock::now() - decompress_start)
+                              .count();
+    std::cerr << "Decompression stage timings:" << std::endl;
+    std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
+    std::cerr << "  Basecalls:       " << basecall_ms << " ms" << std::endl;
+    std::cerr << "  Quality scores:  " << quality_ms << " ms" << std::endl;
+    std::cerr << "  Line lengths:    " << line_length_ms << " ms" << std::endl;
+    std::cerr << "  Rebuild:         " << rebuild_ms << " ms" << std::endl;
+    std::cerr << "  Total decompress:" << total_ms << " ms" << std::endl;
+  }
+
+  return result;
 }
 
 } // namespace gpufastq
