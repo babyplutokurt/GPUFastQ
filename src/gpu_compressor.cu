@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -2201,11 +2202,10 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
                          .count();
     std::cerr << "  Time: " << line_length_ms << " ms" << std::endl;
 
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              Clock::now() - compression_start)
+                              .count();
     if (bsc_config.stat_mode) {
-      const auto total_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              Clock::now() - compression_start)
-              .count();
       std::cerr << "Compression stage timings:" << std::endl;
       std::cerr << "  Field prep:      " << field_prep_ms << " ms" << std::endl;
       std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
@@ -2214,6 +2214,23 @@ CompressedFastqData compress_fastq(const FastqData &data, size_t chunk_size,
       std::cerr << "  Line lengths:    " << line_length_ms << " ms"
                 << std::endl;
       std::cerr << "  Total compress:  " << total_ms << " ms" << std::endl;
+    }
+
+    if (!bsc_config.log_stat_path.empty()) {
+      std::ofstream log(bsc_config.log_stat_path, std::ios::app);
+      if (log.is_open()) {
+        log << "Compressor:\n";
+        log << "  Field prep:      " << field_prep_ms << " ms\n";
+        log << "  Identifiers:     " << identifier_ms << " ms, "
+            << stats.identifiers_size << " B\n";
+        log << "  Basecalls:       " << basecall_ms << " ms, "
+            << stats.basecalls_size << " B\n";
+        log << "  Quality scores:  " << quality_ms << " ms, "
+            << stats.quality_scores_size << " B\n";
+        log << "  Line lengths:    " << line_length_ms << " ms, "
+            << stats.line_length_size << " B\n";
+        log << "  Total compress:  " << total_ms << " ms\n";
+      }
     }
   } catch (...) {
     cuda_free_if_set(d_line_lengths);
@@ -2388,10 +2405,10 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
                               Clock::now() - rebuild_start)
                               .count();
 
+  const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - decompress_start)
+                            .count();
   if (bsc_config.stat_mode) {
-    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              Clock::now() - decompress_start)
-                              .count();
     std::cerr << "Decompression stage timings:" << std::endl;
     std::cerr << "  Identifiers:     " << identifier_ms << " ms" << std::endl;
     std::cerr << "  Basecalls:       " << basecall_ms << " ms" << std::endl;
@@ -2399,6 +2416,23 @@ FastqData decompress_fastq(const CompressedFastqData &compressed,
     std::cerr << "  Line lengths:    " << line_length_ms << " ms" << std::endl;
     std::cerr << "  Rebuild:         " << rebuild_ms << " ms" << std::endl;
     std::cerr << "  Total decompress:" << total_ms << " ms" << std::endl;
+  }
+
+  if (!bsc_config.log_stat_path.empty()) {
+    std::ofstream log(bsc_config.log_stat_path, std::ios::app);
+    if (log.is_open()) {
+      log << "Decompressor:\n";
+      log << "  Identifiers:     " << identifier_ms << " ms, "
+          << identifiers.size() << " B\n";
+      log << "  Basecalls:       " << basecall_ms << " ms, " << basecalls.size()
+          << " B\n";
+      log << "  Quality scores:  " << quality_ms << " ms, "
+          << quality_scores.size() << " B\n";
+      log << "  Line lengths:    " << line_length_ms << " ms, "
+          << line_offset_bytes.size() << " B\n";
+      log << "  Rebuild:         " << rebuild_ms << " ms\n";
+      log << "  Total decompress:" << total_ms << " ms\n";
+    }
   }
 
   return result;

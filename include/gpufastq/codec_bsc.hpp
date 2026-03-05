@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct BscConfig {
   size_t gpu_jobs = 0;
   bool zstd_transpose_quality = false;
   bool stat_mode = false;
+  std::string log_stat_path;
 };
 
 struct ResolvedBscConfig {

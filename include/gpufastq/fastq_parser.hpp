@@ -6,7 +6,8 @@
 namespace gpufastq {
 
 /// Parse a FASTQ file into a raw byte buffer and a line-start index.
-FastqData parse_fastq(const std::string &filepath, bool stat_mode = false);
+FastqData parse_fastq(const std::string &filepath, bool stat_mode = false,
+                      const std::string &log_stat_path = "");
 
 /// Summarize the byte size of the extracted FASTQ field streams and line
 /// lengths.

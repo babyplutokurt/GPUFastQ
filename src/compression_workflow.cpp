@@ -39,13 +39,15 @@ int compress(const std::string &input_path, const std::string &output_path,
   const auto t0 = clock::now();
 
   std::cerr << "=== Parsing FASTQ: " << input_path << " ===\n";
-  const auto data = parse_fastq(input_path, bsc_config.stat_mode);
+  const auto data =
+      parse_fastq(input_path, bsc_config.stat_mode, bsc_config.log_stat_path);
   const auto stats = compute_field_stats(data);
   const auto t1 = clock::now();
 
   std::cerr << "Parsed " << data.num_records << " records\n"
             << "  FASTQ bytes:     " << data.raw_bytes.size() << " B\n"
-            << "  Line offsets:    " << data.line_offsets.size() << " B\n"
+            << "  Line offsets:    "
+            << data.line_offsets.size() * sizeof(uint64_t) << " B\n"
             << "  Identifiers:     " << stats.identifiers_size << " B\n"
             << "  Basecalls:       " << stats.basecalls_size << " B\n"
             << "  Quality scores:  " << stats.quality_scores_size << " B\n"
@@ -105,7 +107,8 @@ int compress(const std::string &input_path, const std::string &output_path,
 int roundtrip(const std::string &input_path, const BscConfig &bsc_config) {
   std::cerr << "=== Round-trip verification ===\n";
 
-  const auto original = parse_fastq(input_path, bsc_config.stat_mode);
+  const auto original =
+      parse_fastq(input_path, bsc_config.stat_mode, bsc_config.log_stat_path);
   std::cerr << "Parsed " << original.num_records << " records\n";
   std::cerr << "Quality layout: "
             << (original.quality_layout == QualityLayoutKind::FixedLength

@@ -10,3 +10,4 @@ build/
 *.fastq
 *.fq
 extern/
+*.txt

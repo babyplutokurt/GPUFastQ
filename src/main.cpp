@@ -59,7 +59,9 @@ void print_usage(const char *prog) {
       << "  --transpose        Transpose fixed-length quality scores before "
          "Zstd compression\n"
       << "  --stat             Print detailed timing statistics for each "
-         "stage\n\n"
+         "stage\n"
+      << "  --log-stat F       Log detailed timing and throughput statistics "
+         "to a file\n\n"
       << "Environment:\n"
       << "  GPUFASTQ_BSC_BACKEND  Default BSC backend when --bsc-backend is "
          "not set\n"
@@ -90,6 +92,13 @@ int main(int argc, char *argv[]) {
       }
       if (arg == "--stat") {
         bsc_config.stat_mode = true;
+        continue;
+      }
+      if (arg == "--log-stat") {
+        if (argi + 1 >= argc) {
+          throw std::runtime_error("Missing value for " + arg);
+        }
+        bsc_config.log_stat_path = argv[++argi];
         continue;
       }
       if (arg == "--quality-codec" || arg == "--bsc-backend" ||

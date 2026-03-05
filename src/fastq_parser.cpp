@@ -243,7 +243,8 @@ void validate_fastq_layout(const FastqData &data) {
 
 } // namespace
 
-FastqData parse_fastq(const std::string &filepath, bool stat_mode) {
+FastqData parse_fastq(const std::string &filepath, bool stat_mode,
+                      const std::string &log_stat_path) {
   using clock = std::chrono::high_resolution_clock;
   const auto t0 = clock::now();
 
@@ -292,22 +293,46 @@ FastqData parse_fastq(const std::string &filepath, bool stat_mode) {
   data.fixed_quality_length = quality_analysis.fixed_length;
 
   const auto t4 = clock::now();
-
   data.identifier_layout = discover_identifier_layout(data);
 
   const auto t5 = clock::now();
 
-  if (stat_mode) {
+  if (stat_mode || !log_stat_path.empty()) {
     auto ms = [](const auto &start, const auto &end) {
       return std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
           .count();
     };
-    std::cerr << "Parser stage timings:" << std::endl;
-    std::cerr << "  Read file:       " << ms(t0, t1) << " ms" << std::endl;
-    std::cerr << "  Indexing:        " << ms(t1, t2) << " ms" << std::endl;
-    std::cerr << "  Validate layout: " << ms(t2, t3) << " ms" << std::endl;
-    std::cerr << "  Analyze quality: " << ms(t3, t4) << " ms" << std::endl;
-    std::cerr << "  Discover schema: " << ms(t4, t5) << " ms" << std::endl;
+    long t_read = ms(t0, t1);
+    long t_idx = ms(t1, t2);
+    long t_val = ms(t2, t3);
+    long t_qual = ms(t3, t4);
+    long t_schema = ms(t4, t5);
+
+    if (stat_mode) {
+      std::cerr << "Parser stage timings:" << std::endl;
+      std::cerr << "  Read file:       " << t_read << " ms" << std::endl;
+      std::cerr << "  Indexing:        " << t_idx << " ms" << std::endl;
+      std::cerr << "  Validate layout: " << t_val << " ms" << std::endl;
+      std::cerr << "  Analyze quality: " << t_qual << " ms" << std::endl;
+      std::cerr << "  Discover schema: " << t_schema << " ms" << std::endl;
+    }
+
+    if (!log_stat_path.empty()) {
+      std::ofstream log(log_stat_path, std::ios::app);
+      if (log.is_open()) {
+        log << "Parser:\n";
+        log << "  Read file:       " << t_read << " ms, "
+            << data.raw_bytes.size() << " B\n";
+        log << "  Indexing:        " << t_idx << " ms, "
+            << data.raw_bytes.size() << " B\n";
+        log << "  Validate layout: " << t_val << " ms, "
+            << data.raw_bytes.size() << " B\n";
+        log << "  Analyze quality: " << t_qual << " ms, "
+            << data.raw_bytes.size() << " B\n";
+        log << "  Discover schema: " << t_schema << " ms, "
+            << data.raw_bytes.size() << " B\n";
+      }
+    }
   }
 
   return data;
