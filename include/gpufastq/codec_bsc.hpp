@@ -29,6 +29,7 @@ struct BscConfig {
   bool zstd_transpose_quality = false;
   bool stat_mode = false;
   std::string log_stat_path;
+  size_t chunk_size_gb = 8;
 };
 
 struct ResolvedBscConfig {

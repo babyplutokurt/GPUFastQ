@@ -15,10 +15,21 @@ template <typename T> void write_val(std::ofstream &f, const T &val) {
 template <typename T> T read_val(std::ifstream &f) {
   T val;
   f.read(reinterpret_cast<char *>(&val), sizeof(T));
-  if (!f) {
+  if (!f && f.gcount() == 0) {
     throw std::runtime_error("Unexpected end of file");
+  } else if (!f) {
+    throw std::runtime_error("Unexpected partial end of file");
   }
   return val;
+}
+
+template <typename T> bool read_val_opt(std::ifstream &f, T &val) {
+  f.read(reinterpret_cast<char *>(&val), sizeof(T));
+  if (f.gcount() == 0)
+    return false;
+  if (!f)
+    throw std::runtime_error("Unexpected partial end of file");
+  return true;
 }
 
 void write_blob(std::ofstream &f, const std::vector<uint8_t> &data) {
@@ -225,12 +236,12 @@ void validate_basecall_stream(const CompressedBasecallData &data) {
 
 } // namespace
 
-void serialize(const std::string &filepath, const CompressedFastqData &data) {
-  std::ofstream file(filepath, std::ios::binary);
-  if (!file.is_open()) {
-    throw std::runtime_error("Cannot open output file: " + filepath);
-  }
+void serialize_header(std::ofstream &file) {
+  write_val(file, MAGIC);
+  write_val(file, FORMAT_VERSION);
+}
 
+void serialize_chunk(std::ofstream &file, const CompressedFastqData &data) {
   validate_identifier_stream(data.identifiers, data.num_records);
   validate_basecall_stream(data.basecalls);
   if (data.quality_codec != QualityCodec::Bsc &&
@@ -278,8 +289,6 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
       data.line_lengths.payload, data.line_lengths.original_size,
       data.compressed_line_length_chunk_sizes, "line-length");
 
-  write_val(file, MAGIC);
-  write_val(file, FORMAT_VERSION);
   write_val(file, data.num_records);
   write_val(file, data.line_offset_count);
 
@@ -369,12 +378,29 @@ void serialize(const std::string &filepath, const CompressedFastqData &data) {
   write_blob(file, data.line_lengths.payload);
 }
 
+void serialize(const std::string &filepath, const CompressedFastqData &data) {
+  std::ofstream file(filepath, std::ios::binary);
+  if (!file.is_open()) {
+    throw std::runtime_error("Cannot open output file: " + filepath);
+  }
+  serialize_header(file);
+  serialize_chunk(file, data);
+}
+
 CompressedFastqData deserialize(const std::string &filepath) {
   std::ifstream file(filepath, std::ios::binary);
   if (!file.is_open()) {
     throw std::runtime_error("Cannot open input file: " + filepath);
   }
+  deserialize_header(file);
+  CompressedFastqData data;
+  if (!deserialize_chunk(file, data)) {
+    throw std::runtime_error("Expected at least one chunk in file");
+  }
+  return data;
+}
 
+void deserialize_header(std::ifstream &file) {
   const uint32_t magic = read_val<uint32_t>(file);
   if (magic != MAGIC) {
     throw std::runtime_error("Invalid file format: bad magic number");
@@ -385,9 +411,12 @@ CompressedFastqData deserialize(const std::string &filepath) {
     throw std::runtime_error("Unsupported format version: " +
                              std::to_string(version));
   }
+}
 
-  CompressedFastqData data;
-  data.num_records = read_val<uint64_t>(file);
+bool deserialize_chunk(std::ifstream &file, CompressedFastqData &data) {
+  if (!read_val_opt(file, data.num_records)) {
+    return false;
+  }
   data.line_offset_count = read_val<uint64_t>(file);
 
   data.identifiers.mode =
@@ -487,7 +516,7 @@ CompressedFastqData deserialize(const std::string &filepath) {
   validate_chunked_stream(data.quality_scores.payload,
                           data.quality_scores.original_size,
                           data.compressed_quality_chunk_sizes, "quality");
-  return data;
+  return true;
 }
 
 } // namespace gpufastq

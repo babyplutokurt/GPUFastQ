@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -38,68 +39,87 @@ int compress(const std::string &input_path, const std::string &output_path,
   using clock = std::chrono::high_resolution_clock;
   const auto t0 = clock::now();
 
-  std::cerr << "=== Parsing FASTQ: " << input_path << " ===\n";
-  const auto data =
-      parse_fastq(input_path, bsc_config.stat_mode, bsc_config.log_stat_path);
-  const auto stats = compute_field_stats(data);
-  const auto t1 = clock::now();
-
-  std::cerr << "Parsed " << data.num_records << " records\n"
-            << "  FASTQ bytes:     " << data.raw_bytes.size() << " B\n"
-            << "  Line offsets:    "
-            << data.line_offsets.size() * sizeof(uint64_t) << " B\n"
-            << "  Identifiers:     " << stats.identifiers_size << " B\n"
-            << "  Basecalls:       " << stats.basecalls_size << " B\n"
-            << "  Quality scores:  " << stats.quality_scores_size << " B\n"
-            << "  Line lengths:    " << stats.line_length_size << " B\n"
-            << "  Quality layout:  "
-            << (data.quality_layout == QualityLayoutKind::FixedLength
-                    ? "fixed"
-                    : "variable");
-  if (data.quality_layout == QualityLayoutKind::FixedLength) {
-    std::cerr << " (" << data.fixed_quality_length << " bases)";
+  std::ifstream infile(input_path, std::ios::binary);
+  if (!infile.is_open()) {
+    std::cerr << "Cannot open input file: " << input_path << "\n";
+    return 1;
   }
-  std::cerr << "\n";
 
-  const size_t raw_payload_size =
-      stats.identifiers_size + stats.basecalls_size +
-      stats.quality_scores_size + stats.line_length_size;
+  std::ofstream outfile(output_path, std::ios::binary);
+  if (!outfile.is_open()) {
+    std::cerr << "Cannot open output file: " << output_path << "\n";
+    return 1;
+  }
+  serialize_header(outfile);
 
-  std::cerr << "\n=== GPU Compression ===\n";
+  size_t chunk_size = bsc_config.chunk_size_gb * 1024ULL * 1024ULL * 1024ULL;
+  if (chunk_size == 0)
+    chunk_size = 8ULL * 1024 * 1024 * 1024ULL;
+
+  uint64_t total_records = 0;
+  size_t total_raw_payload = 0;
+  size_t total_compressed_payload = 0;
+  long long t_parse = 0;
+  long long t_compress = 0;
+  long long t_serialize = 0;
+
   if (bsc_config.backend != BscBackend::Default) {
-    std::cerr << "BSC backend:       " << bsc_backend_name(bsc_config.backend)
+    std::cerr << "BSC backend: " << bsc_backend_name(bsc_config.backend)
               << "\n";
   }
-  const auto compressed = compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_config);
-  const auto t2 = clock::now();
 
-  const size_t compressed_payload_size =
-      compressed_identifier_size(compressed.identifiers) +
-      compressed.basecalls.packed_bases.payload.size() +
-      compressed.basecalls.n_counts.payload.size() +
-      compressed.basecalls.n_positions.payload.size() +
-      compressed.quality_scores.payload.size() +
-      compressed.line_lengths.payload.size();
+  int chunk_idx = 1;
+  while (!infile.eof() && infile.peek() != std::char_traits<char>::eof()) {
+    std::cerr << "=== Processing Chunk " << chunk_idx++ << " ===\n";
+    const auto t_chunk_start = clock::now();
+    auto data = parse_fastq_chunk(infile, chunk_size, bsc_config.stat_mode,
+                                  bsc_config.log_stat_path);
+    if (data.num_records == 0)
+      break;
 
-  std::cerr << "\n=== Serializing: " << output_path << " ===\n";
-  serialize(output_path, compressed);
+    const auto stats = compute_field_stats(data);
+    const auto t_chunk_parsed = clock::now();
+    t_parse += elapsed_ms(t_chunk_start, t_chunk_parsed);
+
+    total_records += data.num_records;
+    total_raw_payload += stats.identifiers_size + stats.basecalls_size +
+                         stats.quality_scores_size + stats.line_length_size;
+
+    const auto compressed =
+        compress_fastq(data, DEFAULT_CHUNK_SIZE, bsc_config);
+    const auto t_chunk_compressed = clock::now();
+    t_compress += elapsed_ms(t_chunk_parsed, t_chunk_compressed);
+
+    total_compressed_payload +=
+        compressed_identifier_size(compressed.identifiers) +
+        compressed.basecalls.packed_bases.payload.size() +
+        compressed.basecalls.n_counts.payload.size() +
+        compressed.basecalls.n_positions.payload.size() +
+        compressed.quality_scores.payload.size() +
+        compressed.line_lengths.payload.size();
+
+    serialize_chunk(outfile, compressed);
+    const auto t_chunk_serialized = clock::now();
+    t_serialize += elapsed_ms(t_chunk_compressed, t_chunk_serialized);
+  }
+
   const auto t3 = clock::now();
-
   const size_t input_size = fs::file_size(input_path);
   const size_t output_size = fs::file_size(output_path);
 
   std::cerr << "\n=== Summary ===\n"
+            << "  Total records:     " << total_records << "\n"
             << "  Input file:        " << input_size << " B\n"
             << "  Output file:       " << output_size << " B\n"
             << "  File ratio:        " << 100.0 * output_size / input_size
             << " %\n"
-            << "  Raw payload:       " << raw_payload_size << " B\n"
-            << "  Compressed payload:" << compressed_payload_size << " B\n"
+            << "  Raw payload:       " << total_raw_payload << " B\n"
+            << "  Compressed payload:" << total_compressed_payload << " B\n"
             << "  Payload ratio:     "
-            << 100.0 * compressed_payload_size / raw_payload_size << " %\n"
-            << "  Parse time:        " << elapsed_ms(t0, t1) << " ms\n"
-            << "  Compress time:     " << elapsed_ms(t1, t2) << " ms\n"
-            << "  Serialize time:    " << elapsed_ms(t2, t3) << " ms\n"
+            << 100.0 * total_compressed_payload / total_raw_payload << " %\n"
+            << "  Parse time:        " << t_parse << " ms\n"
+            << "  Compress time:     " << t_compress << " ms\n"
+            << "  Serialize time:    " << t_serialize << " ms\n"
             << "  Total time:        " << elapsed_ms(t0, t3) << " ms\n";
   return 0;
 }
@@ -107,37 +127,83 @@ int compress(const std::string &input_path, const std::string &output_path,
 int roundtrip(const std::string &input_path, const BscConfig &bsc_config) {
   std::cerr << "=== Round-trip verification ===\n";
 
-  const auto original =
-      parse_fastq(input_path, bsc_config.stat_mode, bsc_config.log_stat_path);
-  std::cerr << "Parsed " << original.num_records << " records\n";
-  std::cerr << "Quality layout: "
-            << (original.quality_layout == QualityLayoutKind::FixedLength
-                    ? "fixed"
-                    : "variable");
-  if (original.quality_layout == QualityLayoutKind::FixedLength) {
-    std::cerr << " (" << original.fixed_quality_length << " bases)";
+  std::ifstream infile(input_path, std::ios::binary);
+  if (!infile.is_open()) {
+    std::cerr << "Cannot open input file: " << input_path << "\n";
+    return 1;
   }
-  std::cerr << "\n";
-
-  const auto compressed =
-      compress_fastq(original, DEFAULT_CHUNK_SIZE, bsc_config);
 
   const std::string tmp_path = input_path + ".gpufq.tmp";
-  serialize(tmp_path, compressed);
-  const auto loaded = deserialize(tmp_path);
-  const auto decoded = decompress_fastq(loaded, bsc_config);
+  std::ofstream outfile(tmp_path, std::ios::binary);
+  serialize_header(outfile);
+
+  size_t chunk_size = bsc_config.chunk_size_gb * 1024ULL * 1024ULL * 1024ULL;
+  if (chunk_size == 0)
+    chunk_size = 8ULL * 1024 * 1024 * 1024ULL;
 
   bool ok = true;
-  if (original.num_records != decoded.num_records) {
-    std::cerr << "FAIL: record count\n";
-    ok = false;
+  int chunk_idx = 1;
+
+  while (!infile.eof() && infile.peek() != std::char_traits<char>::eof()) {
+    std::cerr << "Chunk " << chunk_idx++ << "...\n";
+    auto original = parse_fastq_chunk(infile, chunk_size, bsc_config.stat_mode,
+                                      bsc_config.log_stat_path);
+    if (original.num_records == 0)
+      break;
+
+    const auto compressed =
+        compress_fastq(original, DEFAULT_CHUNK_SIZE, bsc_config);
+    serialize_chunk(outfile, compressed);
+
+    // We can't decompress until everything is written, or we could stream from
+    // a string. However, roundtrip here is simplified. For chunked roundtrip,
+    // we'll write everything, then read back.
   }
-  if (original.raw_bytes != decoded.raw_bytes) {
-    std::cerr << "FAIL: raw FASTQ bytes\n";
-    ok = false;
+  outfile.close();
+
+  // Now verify
+  std::ifstream decoded_in(tmp_path, std::ios::binary);
+  deserialize_header(decoded_in);
+
+  std::ifstream orig_in(input_path, std::ios::binary);
+
+  chunk_idx = 1;
+  while (!orig_in.eof() && orig_in.peek() != std::char_traits<char>::eof()) {
+    auto original = parse_fastq_chunk(orig_in, chunk_size, false);
+    if (original.num_records == 0)
+      break;
+
+    CompressedFastqData compressed;
+    if (!deserialize_chunk(decoded_in, compressed)) {
+      std::cerr << "FAIL: Output stream ended prematurely on chunk "
+                << chunk_idx << "\n";
+      ok = false;
+      break;
+    }
+
+    const auto decoded = decompress_fastq(compressed, bsc_config);
+
+    if (original.num_records != decoded.num_records) {
+      std::cerr << "FAIL: chunk " << chunk_idx << " record count\n";
+      ok = false;
+    }
+    if (original.raw_bytes != decoded.raw_bytes) {
+      std::cerr << "FAIL: chunk " << chunk_idx << " raw FASTQ bytes\n";
+      ok = false;
+    }
+    if (original.line_offsets != decoded.line_offsets) {
+      std::cerr << "FAIL: chunk " << chunk_idx << " line offsets\n";
+      ok = false;
+    }
+    if (!ok)
+      break;
+    chunk_idx++;
   }
-  if (original.line_offsets != decoded.line_offsets) {
-    std::cerr << "FAIL: line offsets\n";
+
+  // Ensure decoded_in doesn't have more chunks
+  CompressedFastqData dummy;
+  if (ok && deserialize_chunk(decoded_in, dummy)) {
+    std::cerr << "FAIL: Output stream has unexpected extra chunks\n";
     ok = false;
   }
 

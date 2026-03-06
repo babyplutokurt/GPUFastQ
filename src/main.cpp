@@ -61,7 +61,8 @@ void print_usage(const char *prog) {
       << "  --stat             Print detailed timing statistics for each "
          "stage\n"
       << "  --log-stat F       Log detailed timing and throughput statistics "
-         "to a file\n\n"
+         "to a file\n"
+      << "  --chunk-size N     Chunk size in GB for processing (default: 8)\n\n"
       << "Environment:\n"
       << "  GPUFASTQ_BSC_BACKEND  Default BSC backend when --bsc-backend is "
          "not set\n"
@@ -102,7 +103,8 @@ int main(int argc, char *argv[]) {
         continue;
       }
       if (arg == "--quality-codec" || arg == "--bsc-backend" ||
-          arg == "--bsc-threads" || arg == "--bsc-gpu-jobs") {
+          arg == "--bsc-threads" || arg == "--bsc-gpu-jobs" ||
+          arg == "--chunk-size") {
         if (argi + 1 >= argc) {
           throw std::runtime_error("Missing value for " + arg);
         }
@@ -113,8 +115,10 @@ int main(int argc, char *argv[]) {
           bsc_config.backend = parse_bsc_backend_arg(value);
         } else if (arg == "--bsc-threads") {
           bsc_config.threads = parse_positive_size_arg(arg, value);
-        } else {
+        } else if (arg == "--bsc-gpu-jobs") {
           bsc_config.gpu_jobs = parse_positive_size_arg(arg, value);
+        } else {
+          bsc_config.chunk_size_gb = parse_positive_size_arg(arg, value);
         }
         continue;
       }
